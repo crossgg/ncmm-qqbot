@@ -1,0 +1,88 @@
+# .goreleaser.yaml for ncmm-qqbot
+# 详情参考: https://goreleaser.com
+
+version: 2
+
+project_name: ncmm-qqbot
+
+dist: ./dist
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ncmm-qqbot-windows
+    env:
+      - CGO_ENABLED=0
+    main: .
+    binary: ncmm-qqbot
+    ldflags:
+      - -s -w
+    goos:
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: ncmm-qqbot-linux
+    env:
+      - CGO_ENABLED=0
+    main: .
+    binary: ncmm-qqbot
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+  - id: ncmm-qqbot-darwin
+    env:
+      - CGO_ENABLED=0
+    main: .
+    binary: ncmm-qqbot
+    ldflags:
+      - -s -w
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: ncmm-qqbot-windows
+    ids:
+      - ncmm-qqbot-windows
+    formats: [ 'zip' ]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - README.md
+      - plugin.json
+      - config.yaml.example
+
+  - id: ncmm-qqbot-unix
+    ids:
+      - ncmm-qqbot-linux
+      - ncmm-qqbot-darwin
+    formats: [ 'tar.gz' ]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - README.md
+      - plugin.json
+      - config.yaml.example
+
+changelog:
+  use: github
+  sort: asc

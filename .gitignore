@@ -1,0 +1,25 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+ncmm-qqbot
+
+# Goreleaser distribution folder
+dist/
+
+# Test artifacts
+*.test
+*.out
+
+# Local runtime files
+config.yaml
+config.yaml.tmp
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

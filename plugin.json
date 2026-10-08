@@ -1,0 +1,46 @@
+{
+  "name": "qqbot",
+  "type": "daemon",
+  "title": "QQ机器人助手",
+  "version": "1.0.0",
+  "description": "基于腾讯官方 QQ 机器人 API v2 的常驻伴生插件，随 ncmm web 自动启停，支持 QQ 私聊自动识别更新 Cookie、扫码登录与通知中继推送",
+  "author": "crossgg",
+  "recommendedCron": "",
+  "params": [
+    {
+      "name": "app_id",
+      "label": "QQ机器人 AppID",
+      "type": "string",
+      "default": "",
+      "description": "腾讯 QQ 开放平台申请的机器人 AppID"
+    },
+    {
+      "name": "client_secret",
+      "label": "AppSecret / ClientSecret",
+      "type": "string",
+      "default": "",
+      "description": "机器人 AppSecret (ClientSecret)"
+    },
+    {
+      "name": "admin_openid",
+      "label": "管理员 OpenID",
+      "type": "string",
+      "default": "",
+      "description": "QQ 私聊中发送 /myid 即可快速获取并填入"
+    },
+    {
+      "name": "port",
+      "label": "本地中继端口",
+      "type": "number",
+      "default": 5606,
+      "description": "本地回环内部通信端口（默认 127.0.0.1:5606，无需对外映射）"
+    },
+    {
+      "name": "host",
+      "label": "监听地址",
+      "type": "string",
+      "default": "127.0.0.1",
+      "description": "监听地址（默认 127.0.0.1 仅限本机；若需局域网访问独立面板可填 0.0.0.0）"
+    }
+  ]
+}
