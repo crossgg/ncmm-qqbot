@@ -265,7 +265,7 @@ type LoginJSONResult struct {
 }
 
 func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content string) {
-	cookieStr := extractCookieString(content)
+	alias, cookieStr := parseCookieInput(content)
 	if cookieStr == "" {
 		h.replyText(ctx, openID, "❌ 无法提取有效 Cookie，请确保包含 MUSIC_U 内容。", msgID)
 		return
@@ -317,8 +317,23 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 		return
 	}
 
-	// 2. 自动匹配账号归属
-	isMain, targetFile := h.detectAccountTarget(cfg.NCMMHome, res.UID)
+	// 2. 匹配账号归属
+	var isMain bool
+	var targetFile string
+	if alias != "" {
+		if strings.EqualFold(alias, "main") || alias == "主账号" || alias == "主" {
+			isMain = true
+		} else {
+			isMain = false
+			if !strings.HasSuffix(strings.ToLower(alias), ".json") {
+				targetFile = alias + ".json"
+			} else {
+				targetFile = alias
+			}
+		}
+	} else {
+		isMain, targetFile = h.detectAccountTarget(cfg.NCMMHome, res.UID)
+	}
 
 	// 3. 执行正式回写命令
 	var finalArgs []string
@@ -517,22 +532,27 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 }
 
 func isCookieString(s string) bool {
-	return strings.Contains(s, "MUSIC_U") || strings.Contains(s, "_ntes_nuid") || strings.Contains(s, "MUSIC_A_T")
+	upper := strings.ToUpper(s)
+	return strings.Contains(upper, "MUSIC_U") ||
+		strings.Contains(upper, "MUSIC_A_T") ||
+		strings.Contains(upper, "_NTES_NUID") ||
+		strings.Contains(upper, "__CSRF") ||
+		strings.Contains(upper, "P_INFO=")
 }
 
-func extractCookieString(content string) string {
+func parseCookieInput(content string) (alias string, cookieStr string) {
 	content = strings.TrimSpace(content)
 	if strings.HasPrefix(strings.ToLower(content), "/cookie") {
-		parts := strings.Fields(content)
-		if len(parts) >= 2 {
-			// /cookie <content> 或 /cookie <alias> <content>
-			if len(parts) >= 3 && !strings.Contains(parts[1], "=") {
-				return strings.Join(parts[2:], " ")
-			}
-			return strings.Join(parts[1:], " ")
+		rest := strings.TrimSpace(content[7:])
+		parts := strings.Fields(rest)
+		if len(parts) >= 2 && !strings.Contains(parts[0], "=") {
+			alias = parts[0]
+			cookieStr = strings.TrimSpace(rest[len(alias):])
+			return alias, cookieStr
 		}
+		return "", rest
 	}
-	return content
+	return "", content
 }
 
 func resolveAccountPath(home, path string) string {

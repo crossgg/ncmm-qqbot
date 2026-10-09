@@ -333,20 +333,24 @@ func (gm *GatewayManager) handleDispatch(ctx context.Context, in payload) {
 		return
 	}
 
-	if eventType == "C2C_MESSAGE_CREATE" {
+	if eventType == "C2C_MESSAGE_CREATE" || eventType == "DIRECT_MESSAGE_CREATE" {
 		var msg C2CMessage
-		if err := json.Unmarshal(in.D, &msg); err == nil {
-			if msg.Author.Bot {
-				return
-			}
-			if !gm.markReply(msg.ID) {
-				log.Printf("[QQBot-Gateway] 忽略重复投递消息: %s", msg.ID)
-				return
-			}
-			if gm.handler != nil {
-				go gm.handler(ctx, &msg)
-			}
+		if err := json.Unmarshal(in.D, &msg); err != nil {
+			log.Printf("[QQBot-Gateway] 解析 %s 消息失败: %v, raw=%s", eventType, err, string(in.D))
+			return
+		}
+		if msg.Author.Bot {
+			return
+		}
+		if !gm.markReply(msg.ID) {
+			log.Printf("[QQBot-Gateway] 忽略重复投递消息: %s", msg.ID)
+			return
+		}
+		if gm.handler != nil {
+			go gm.handler(ctx, &msg)
 		}
 		return
 	}
+
+	log.Printf("[QQBot-Gateway] 收到事件: %s", eventType)
 }

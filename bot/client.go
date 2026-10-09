@@ -27,6 +27,9 @@ type Client struct {
 	mu          sync.RWMutex
 	accessToken string
 	expireAt    time.Time
+
+	seqMu   sync.Mutex
+	msgSeqs map[string]int
 }
 
 func NewClient(appID, clientSecret string) *Client {
@@ -34,7 +37,26 @@ func NewClient(appID, clientSecret string) *Client {
 		appID:        strings.TrimSpace(appID),
 		clientSecret: strings.TrimSpace(clientSecret),
 		httpClient:   &http.Client{Timeout: 15 * time.Second},
+		msgSeqs:      make(map[string]int),
 	}
+}
+
+func (c *Client) nextMsgSeq(msgID string) int {
+	if msgID == "" {
+		return 0
+	}
+	c.seqMu.Lock()
+	defer c.seqMu.Unlock()
+	if c.msgSeqs == nil {
+		c.msgSeqs = make(map[string]int)
+	}
+	c.msgSeqs[msgID]++
+	seq := c.msgSeqs[msgID]
+	if len(c.msgSeqs) > 2000 {
+		c.msgSeqs = make(map[string]int)
+		c.msgSeqs[msgID] = seq
+	}
+	return seq
 }
 
 func (c *Client) UpdateCredentials(appID, clientSecret string) {
@@ -187,7 +209,7 @@ func (c *Client) SendC2CMessage(ctx context.Context, openID, content, msgID stri
 	}
 	if msgID != "" {
 		reqData["msg_id"] = msgID
-		reqData["msg_seq"] = 1
+		reqData["msg_seq"] = c.nextMsgSeq(msgID)
 	}
 	data, _ := json.Marshal(reqData)
 
@@ -232,7 +254,7 @@ func (c *Client) SendC2CImage(ctx context.Context, openID string, imageBytes []b
 	_ = w.WriteField("srv_send_msg", "true")
 	if msgID != "" {
 		_ = w.WriteField("msg_id", msgID)
-		_ = w.WriteField("msg_seq", "1")
+		_ = w.WriteField("msg_seq", strconv.Itoa(c.nextMsgSeq(msgID)))
 	}
 
 	part, err := w.CreateFormFile("file_data", "qrcode.png")
