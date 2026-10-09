@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -147,7 +148,7 @@ func (h *Handler) handleHelp(ctx context.Context, openID, msgID string) {
 	menu := `📖【NCMM QQ 机器人功能菜单】
 ------------------------
 🔑 账号登录与 Cookie 更新：
-• /login 或 /qrcode  ：获取网易云登录二维码（扫码最便捷）
+• /login 或 /qrcode  ：获取网易云登录授权链接（手机点击一键授权最便捷）
 • 发送文件（强烈推荐）：直接发送包含 Cookie 的【.txt/.json】文件，秒级解析并绑定
 • 发送文本          ：/cookie MUSIC_U=xxxxxx 或完整 Cookie
 • 指定小号更新      ：/cookie <账号别名> MUSIC_U=xxxxxx
@@ -346,8 +347,8 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 			"1️⃣ 发送文件（强烈推荐）：\n" +
 			"• 直接向机器人发送包含 Cookie 的【.txt】或【.json】文本文件\n" +
 			"• 彻底避免长文本密文被 QQ 平台安全策略拦截！\n\n" +
-			"2️⃣ 扫码登录（最便捷）：\n" +
-			"• 发送 /login 即可获取网易云登录二维码\n\n" +
+			"2️⃣ 授权登录（最便捷）：\n" +
+			"• 发送 /login 即可获取网易云登录授权链接\n\n" +
 			"3️⃣ 发送文本：\n" +
 			"• 自动识别并保存: /cookie MUSIC_U=xxxxxx\n" +
 			"• 指定绑定为主账号: /cookie main MUSIC_U=xxxxxx\n" +
@@ -391,13 +392,16 @@ func (h *Handler) processCookieString(ctx context.Context, openID, msgID, alias,
 	}
 
 	var res LoginJSONResult
-	// 找到 JSON 行
+	// 找到 JSON 行 (兼容带 NCMM_LOGIN_RESULT 前缀输出)
 	lines := strings.Split(probeOut.String(), "\n")
 	foundJSON := false
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
-			if json.Unmarshal([]byte(line), &res) == nil && res.UID > 0 {
+		line = strings.TrimPrefix(line, "NCMM_LOGIN_RESULT")
+		line = strings.TrimSpace(line)
+		if idx := strings.Index(line, "{"); idx >= 0 && strings.HasSuffix(line, "}") {
+			jsonStr := line[idx:]
+			if json.Unmarshal([]byte(jsonStr), &res) == nil && res.UID > 0 {
 				foundJSON = true
 				break
 			}
@@ -546,87 +550,68 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 		return
 	}
 
-	exePath, err := os.Executable()
-	var baseDir string
-	if err == nil {
-		baseDir = filepath.Dir(exePath)
-	} else {
-		baseDir = "."
-	}
-	tmpBase := filepath.Join(baseDir, "tmp")
-	_ = os.MkdirAll(tmpBase, 0755)
-
-	// 发起扫码前清理历史残留临时文件（超过 10 分钟）
-	CleanExpiredTempDirs(tmpBase, 10*time.Minute)
-
-	tempDir, err := os.MkdirTemp(tmpBase, "qr-*")
-	if err != nil {
-		h.replyText(ctx, openID, "创建临时目录失败: "+err.Error(), msgID)
-		return
-	}
-	defer os.RemoveAll(tempDir)
-
-	h.replyText(ctx, openID, "📱 正在生成网易云音乐登录二维码，请稍候...", msgID)
+	h.replyText(ctx, openID, "📱 正在生成网易云音乐登录授权链接，请稍候...", msgID)
 
 	qrCmdCtx, qrCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer qrCancel()
 
 	// 启动 ncmm login qrcode
-	cmd := exec.CommandContext(qrCmdCtx, ncmmExe, "login", "qrcode", "-d", tempDir)
+	cmd := exec.CommandContext(qrCmdCtx, ncmmExe, "login", "qrcode")
 	cmd.Dir = cfg.NCMMHome
 
-	var stdoutBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stdoutBuf
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		h.replyText(ctx, openID, "❌ 创建管道失败: "+err.Error(), msgID)
+		return
+	}
+	var outputBuf bytes.Buffer
+	cmd.Stderr = &outputBuf
 
 	if err := cmd.Start(); err != nil {
-		h.replyText(ctx, openID, "❌ 启动扫码命令失败: "+err.Error(), msgID)
+		h.replyText(ctx, openID, "❌ 启动登录命令失败: "+err.Error(), msgID)
 		return
 	}
 
-	qrPath := filepath.Join(tempDir, "qrcode.png")
-
-	// 轮询等待二维码图片生成
-	for i := 0; i < 50; i++ {
-		time.Sleep(300 * time.Millisecond)
-		if fileExists(qrPath) {
-			imgBytes, err := os.ReadFile(qrPath)
-			if err == nil && len(imgBytes) > 0 {
-				// 优先直接发送图片
-				sendImgErr := h.client.SendC2CImage(ctx, openID, imgBytes, msgID)
-				if sendImgErr != nil {
-					log.Printf("[QQBot-Qrcode] 发送二维码图片失败: %v，准备发送兜底文字链接", sendImgErr)
+	codeKeyChan := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(io.TeeReader(stdoutPipe, &outputBuf))
+		reKey := regexp.MustCompile(`codekey=([a-zA-Z0-9-]+)`)
+		foundKey := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !foundKey && reKey.MatchString(line) {
+				m := reKey.FindStringSubmatch(line)
+				if len(m) > 1 {
+					foundKey = true
+					codeKeyChan <- m[1]
 				}
-				break
 			}
 		}
-	}
-
-	// 兜底文字链接
-	time.Sleep(500 * time.Millisecond)
-	outputSoFar := stdoutBuf.String()
-	var codeKey string
-	if re := regexp.MustCompile(`codekey=([a-zA-Z0-9-]+)`); re.MatchString(outputSoFar) {
-		m := re.FindStringSubmatch(outputSoFar)
-		if len(m) > 1 {
-			codeKey = m[1]
+		if !foundKey {
+			close(codeKeyChan)
 		}
+	}()
+
+	select {
+	case codeKey, ok := <-codeKeyChan:
+		if ok && codeKey != "" {
+			hintMsg := fmt.Sprintf("👉 请使用手机点击以下授权链接完成登录：\nhttps://music.163.com/login?codekey=%s\n\n⏰ 有效时间 5 分钟，在手机网易云音乐确认授权后将自动更新并绑定凭据！", codeKey)
+			h.replyText(ctx, openID, hintMsg, msgID)
+		} else {
+			h.replyText(ctx, openID, "⚠️ 未能从服务中获取到授权标识，请稍候重试。", msgID)
+		}
+	case <-time.After(10 * time.Second):
+		h.replyText(ctx, openID, "⚠️ 获取授权链接超时，请稍候重试。", msgID)
 	}
 
-	hintMsg := "👉 请使用【网易云音乐手机 App】扫码授权登录。\n有效时间 5 分钟，扫码确认后将自动更新凭据！"
-	if codeKey != "" {
-		hintMsg += fmt.Sprintf("\n\n若上方未显示图片，请点击扫码授权链接：\nhttps://music.163.com/login?codekey=%s", codeKey)
-	}
-	h.replyText(ctx, openID, hintMsg, msgID)
-
-	// 等待扫码完成
+	// 等待授权完成
 	waitErr := cmd.Wait()
 	if waitErr != nil {
-		h.replyText(context.Background(), openID, "⏳ 扫码登录已超时或已取消。", "")
+		h.replyText(context.Background(), openID, "⏳ 登录已超时或已取消。", "")
 		return
 	}
 
-	out := stdoutBuf.String()
+	out := outputBuf.String()
 	nickname := "未知"
 	if re := regexp.MustCompile(`nickname=([^\s\r\n]+)`); re.MatchString(out) {
 		m := re.FindStringSubmatch(out)
@@ -635,7 +620,7 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 		}
 	}
 
-	successMsg := fmt.Sprintf("🎉 扫码登录成功！\n账号【%s】Cookie 已更新并自动回写到系统配置中！", nickname)
+	successMsg := fmt.Sprintf("🎉 登录成功！\n账号【%s】Cookie 已更新并自动回写到系统配置中！", nickname)
 	h.replyText(context.Background(), openID, successMsg, "")
 }
 
