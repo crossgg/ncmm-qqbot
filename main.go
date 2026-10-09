@@ -63,6 +63,7 @@ type handlerAdapter struct {
 func (ha *handlerAdapter) Get() handler.ConfigData {
 	c := ha.app.cm.Get()
 	return handler.ConfigData{
+		AutoNotify:   c.AutoNotify,
 		AppID:        c.AppID,
 		ClientSecret: c.ClientSecret,
 		AdminOpenID:  c.AdminOpenID,
@@ -75,6 +76,7 @@ func (ha *handlerAdapter) Get() handler.ConfigData {
 
 func (ha *handlerAdapter) Save(d *handler.ConfigData) error {
 	newCfg := &Config{
+		AutoNotify:   d.AutoNotify,
 		AppID:        d.AppID,
 		ClientSecret: d.ClientSecret,
 		AdminOpenID:  d.AdminOpenID,
@@ -102,6 +104,7 @@ type serverAdapter struct {
 func (sa *serverAdapter) Get() server.ConfigDTO {
 	c := sa.app.cm.Get()
 	return server.ConfigDTO{
+		AutoNotify:   c.AutoNotify,
 		AppID:        c.AppID,
 		ClientSecret: c.ClientSecret,
 		AdminOpenID:  c.AdminOpenID,
@@ -114,6 +117,7 @@ func (sa *serverAdapter) Get() server.ConfigDTO {
 
 func (sa *serverAdapter) Save(d *server.ConfigDTO) error {
 	newCfg := &Config{
+		AutoNotify:   d.AutoNotify,
 		AppID:        d.AppID,
 		ClientSecret: d.ClientSecret,
 		AdminOpenID:  d.AdminOpenID,

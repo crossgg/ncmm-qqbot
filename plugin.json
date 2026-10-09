@@ -8,6 +8,13 @@
   "recommendedCron": "",
   "params": [
     {
+      "name": "auto_notify",
+      "label": "开启系统通知推送",
+      "type": "boolean",
+      "default": true,
+      "description": "开启后自动在宿主 notify.yaml 中配置并启用 Webhook 通知渠道（端口与下方服务端口一致）"
+    },
+    {
       "name": "app_id",
       "label": "QQ机器人 AppID",
       "type": "string",

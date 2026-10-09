@@ -27,6 +27,7 @@ type ConfigGetter interface {
 }
 
 type ConfigData struct {
+	AutoNotify   *bool
 	AppID        string
 	ClientSecret string
 	AdminOpenID  string

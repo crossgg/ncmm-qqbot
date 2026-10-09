@@ -20,6 +20,7 @@ type ConfigManager interface {
 }
 
 type ConfigDTO struct {
+	AutoNotify   *bool  `json:"auto_notify"`
 	AppID        string `json:"app_id"`
 	ClientSecret string `json:"client_secret"`
 	AdminOpenID  string `json:"admin_openid"`
@@ -226,6 +227,10 @@ func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Host == "" {
 		req.Host = "0.0.0.0"
+	}
+	if req.AutoNotify == nil {
+		defTrue := true
+		req.AutoNotify = &defTrue
 	}
 
 	if err := s.cm.Save(&req); err != nil {
@@ -435,6 +440,49 @@ const htmlTemplate = `<!DOCTYPE html>
       box-shadow: 0 4px 12px rgba(0,0,0,0.4);
       z-index: 1000;
     }
+
+    .notify-toggle-card {
+      background: #0f172a;
+      padding: 14px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 24px;
+      flex-shrink: 0;
+      margin: 0;
+      cursor: pointer;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #334155;
+      transition: .3s;
+      border-radius: 24px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .3s;
+      border-radius: 50%;
+    }
+    .switch input:checked + .slider { background-color: var(--primary); }
+    .switch input:checked + .slider:before { transform: translateX(20px); }
   </style>
 </head>
 <body>
@@ -460,6 +508,19 @@ const htmlTemplate = `<!DOCTYPE html>
       <div class="card">
         <h2>⚙️ 核心参数在线配置</h2>
         <form id="cfgForm">
+          <div class="notify-toggle-card">
+            <div>
+              <label for="auto_notify" style="margin: 0; font-size: 14px; font-weight: 600; color: #fff; cursor: pointer;">
+                🔔 开启系统通知推送
+              </label>
+              <div class="help-text" style="margin-top: 2px;">自动在宿主 notify.yaml 中配置并启用 Webhook，端口与下方保持一致。</div>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="auto_notify" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
           <div class="form-group">
             <label>QQ 机器人 AppID <span style="color:var(--error)">*</span></label>
             <input type="text" id="app_id" placeholder="例如: 102030405" required>
@@ -508,9 +569,9 @@ const htmlTemplate = `<!DOCTYPE html>
       <div class="card">
         <h2>📋 通知中继与对接说明</h2>
         <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
-          若需接收 <code>ncmm</code> 每日打卡与任务异常汇总，请确保宿主 <code>config/notify.yaml</code> 中启用了本地 Webhook：
+          开启上方【开启系统通知推送】后，插件会自动在宿主 <code>notify.yaml</code> 中写入并激活 Webhook，端口与配置实时同步：
         </p>
-        <pre style="background: #0f172a; padding: 14px; border-radius: 8px; font-size: 12px; color: #38bdf8; overflow-x: auto;">
+        <pre style="background: #0f172a; padding: 14px; border-radius: 8px; font-size: 12px; color: #38bdf8; overflow-x: auto;" id="webhookPreview">
 webhook:
   enabled: true
   url: "http://127.0.0.1:5606/notify"
@@ -552,12 +613,14 @@ webhook:
         
         // 更新表单
         if (data.config) {
+          document.getElementById('auto_notify').checked = data.config.auto_notify !== false;
           document.getElementById('app_id').value = data.config.app_id || '';
           document.getElementById('client_secret').value = data.config.client_secret || '';
           document.getElementById('admin_openid').value = data.config.admin_openid || '';
           document.getElementById('port').value = data.config.port || 5606;
           document.getElementById('host').value = data.config.host || '0.0.0.0';
           document.getElementById('ncmm_home').value = data.config.ncmm_home || '';
+          updateWebhookPreview();
         }
 
         // 状态徽标
@@ -587,9 +650,21 @@ webhook:
       }
     }
 
+    function updateWebhookPreview() {
+      const p = parseInt(document.getElementById('port').value) || 5606;
+      const isChecked = document.getElementById('auto_notify').checked;
+      const el = document.getElementById('webhookPreview');
+      if (el) {
+        el.innerText = 'webhook:\n  enabled: ' + isChecked + '\n  url: "http://127.0.0.1:' + p + '/notify"\n  method: POST';
+      }
+    }
+    document.getElementById('port').addEventListener('input', updateWebhookPreview);
+    document.getElementById('auto_notify').addEventListener('change', updateWebhookPreview);
+
     document.getElementById('cfgForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       const payload = {
+        auto_notify: document.getElementById('auto_notify').checked,
         app_id: document.getElementById('app_id').value.trim(),
         client_secret: document.getElementById('client_secret').value.trim(),
         admin_openid: document.getElementById('admin_openid').value.trim(),
