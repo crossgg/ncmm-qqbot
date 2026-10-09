@@ -2,7 +2,7 @@
   "name": "qqbot",
   "type": "daemon",
   "title": "QQ机器人助手",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "基于腾讯官方 QQ 机器人 API v2 的常驻伴生插件，随 ncmm web 自动启停，支持 QQ 私聊自动识别更新 Cookie、扫码登录与通知中继推送",
   "author": "crossgg",
   "recommendedCron": "",
