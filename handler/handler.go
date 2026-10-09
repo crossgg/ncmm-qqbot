@@ -267,7 +267,13 @@ type LoginJSONResult struct {
 func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content string) {
 	alias, cookieStr := parseCookieInput(content)
 	if cookieStr == "" {
-		h.replyText(ctx, openID, "❌ 无法提取有效 Cookie，请确保包含 MUSIC_U 内容。", msgID)
+		msg := "💡 Cookie 绑定与更新说明：\n" +
+			"直接发送 Cookie 字符串或使用以下指令：\n" +
+			"• 自动识别并保存: /cookie MUSIC_U=xxxxxx\n" +
+			"• 指定绑定为主账号: /cookie main MUSIC_U=xxxxxx\n" +
+			"• 指定绑定为副账号: /cookie 4265 MUSIC_U=xxxxxx\n\n" +
+			"⚠️ 提示: QQ 平台限制单条私聊长度（最大约 2000 字符）。若从浏览器复制的完整 Cookie 较长会被 QQ 拦截丢弃，请仅复制发送核心参数【MUSIC_U=...】即可！"
+		h.replyText(ctx, openID, msg, msgID)
 		return
 	}
 
@@ -451,7 +457,20 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 		return
 	}
 
-	tempDir, err := os.MkdirTemp("", "ncmm-qq-qrcode-*")
+	exePath, err := os.Executable()
+	var baseDir string
+	if err == nil {
+		baseDir = filepath.Dir(exePath)
+	} else {
+		baseDir = "."
+	}
+	tmpBase := filepath.Join(baseDir, "tmp")
+	_ = os.MkdirAll(tmpBase, 0755)
+
+	// 发起扫码前清理历史残留临时文件（超过 10 分钟）
+	CleanExpiredTempDirs(tmpBase, 10*time.Minute)
+
+	tempDir, err := os.MkdirTemp(tmpBase, "qr-*")
 	if err != nil {
 		h.replyText(ctx, openID, "创建临时目录失败: "+err.Error(), msgID)
 		return
@@ -574,4 +593,22 @@ func resolveAccountPath(home, path string) string {
 func fileExists(p string) bool {
 	info, err := os.Stat(p)
 	return err == nil && !info.IsDir()
+}
+
+// CleanExpiredTempDirs 清理目录下超过指定时长的子文件与目录
+func CleanExpiredTempDirs(tmpBase string, maxAge time.Duration) {
+	entries, err := os.ReadDir(tmpBase)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > maxAge {
+			_ = os.RemoveAll(filepath.Join(tmpBase, entry.Name()))
+		}
+	}
 }

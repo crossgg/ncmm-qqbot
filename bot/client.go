@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"strconv"
@@ -299,4 +300,136 @@ func (c *Client) TestCredentials(ctx context.Context) (string, error) {
 	}
 	_ = token
 	return gateway, nil
+}
+
+type PanelItem struct {
+	Type      string `json:"type"` // command 或 link
+	Name      string `json:"name"` // 最多 14 字符（约 7 个汉字）
+	Desc      string `json:"desc"` // 最多 30 字符（约 15 个汉字）
+	OnlyAdmin bool   `json:"only_admin,omitempty"`
+	Link      string `json:"link,omitempty"`
+}
+
+type PanelConfig struct {
+	Items  []PanelItem `json:"items"`
+	Remark string      `json:"remark,omitempty"`
+}
+
+type PanelRecord struct {
+	PanelID    string      `json:"panel_id"`
+	Scope      string      `json:"scope"`
+	TargetType string      `json:"target_type"`
+	Panel      PanelConfig `json:"panel"`
+}
+
+type PanelListResponse struct {
+	Records []PanelRecord `json:"records"`
+}
+
+type CreatePanelRequest struct {
+	Scope      string      `json:"scope"`
+	TargetType string      `json:"target_type"`
+	Panel      PanelConfig `json:"panel"`
+}
+
+type UpdatePanelRequest struct {
+	Panel PanelConfig `json:"panel"`
+}
+
+// SyncCommandPanel 自动注册或更新 QQ 机器人的全局指令面板（/help, /login, /cookie, /status 等）
+func (c *Client) SyncCommandPanel(ctx context.Context) error {
+	token, err := c.GetAccessToken(ctx, false)
+	if err != nil {
+		return err
+	}
+
+	items := []PanelItem{
+		{Type: "command", Name: "/help", Desc: "查看使用帮助及指令列表"},
+		{Type: "command", Name: "/login", Desc: "扫码登录并同步网易云凭据"},
+		{Type: "command", Name: "/cookie", Desc: "更新或绑定网易云 Cookie"},
+		{Type: "command", Name: "/status", Desc: "查看服务与账号状态"},
+		{Type: "command", Name: "/bind", Desc: "绑定当前管理员权限"},
+		{Type: "command", Name: "/myid", Desc: "查看当前用户的 QQ OpenID"},
+		{Type: "command", Name: "/run sign", Desc: "立即触发日常签到任务"},
+		{Type: "command", Name: "/run task", Desc: "立即触发全量批量任务"},
+	}
+
+	scopes := []string{"c2c", "group"}
+	for _, scope := range scopes {
+		getURL := fmt.Sprintf("%s/v2/panels?scope=%s&limit=20", BaseAPIURL, scope)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "QQBot "+token)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			log.Printf("[QQBot-Panel] 查询 %s 指令面板失败: %v", scope, err)
+			continue
+		}
+
+		var listResp PanelListResponse
+		_ = json.NewDecoder(resp.Body).Decode(&listResp)
+		resp.Body.Close()
+
+		var matchedPanelID string
+		for _, rec := range listResp.Records {
+			if rec.TargetType == "all" && (rec.Panel.Remark == "ncmm_command_panel" || rec.Scope == scope) {
+				matchedPanelID = rec.PanelID
+				break
+			}
+		}
+
+		panelCfg := PanelConfig{
+			Items:  items,
+			Remark: "ncmm_command_panel",
+		}
+
+		if matchedPanelID != "" {
+			putURL := fmt.Sprintf("%s/v2/panels/%s", BaseAPIURL, matchedPanelID)
+			bodyBytes, _ := json.Marshal(UpdatePanelRequest{Panel: panelCfg})
+			putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, bytes.NewReader(bodyBytes))
+			if err != nil {
+				continue
+			}
+			putReq.Header.Set("Authorization", "QQBot "+token)
+			putReq.Header.Set("Content-Type", "application/json")
+			putResp, err := c.httpClient.Do(putReq)
+			if err == nil {
+				respBody, _ := io.ReadAll(putResp.Body)
+				putResp.Body.Close()
+				if putResp.StatusCode == http.StatusOK {
+					log.Printf("[QQBot-Panel] 成功更新 %s 指令面板 (id=%s)", scope, matchedPanelID)
+				} else {
+					log.Printf("[QQBot-Panel] 更新 %s 指令面板返回状态码 %d: %s", scope, putResp.StatusCode, string(respBody))
+				}
+			}
+		} else {
+			postURL := fmt.Sprintf("%s/v2/panels", BaseAPIURL)
+			bodyBytes, _ := json.Marshal(CreatePanelRequest{
+				Scope:      scope,
+				TargetType: "all",
+				Panel:      panelCfg,
+			})
+			postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, postURL, bytes.NewReader(bodyBytes))
+			if err != nil {
+				continue
+			}
+			postReq.Header.Set("Authorization", "QQBot "+token)
+			postReq.Header.Set("Content-Type", "application/json")
+			postResp, err := c.httpClient.Do(postReq)
+			if err == nil {
+				respBody, _ := io.ReadAll(postResp.Body)
+				postResp.Body.Close()
+				if postResp.StatusCode == http.StatusOK || postResp.StatusCode == http.StatusCreated {
+					log.Printf("[QQBot-Panel] 成功创建 %s 指令面板: %s", scope, string(respBody))
+				} else {
+					log.Printf("[QQBot-Panel] 创建 %s 指令面板返回状态码 %d: %s", scope, postResp.StatusCode, string(respBody))
+				}
+			}
+		}
+	}
+
+	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/crossgg/ncmm-qqbot/bot"
 	"github.com/crossgg/ncmm-qqbot/handler"
@@ -172,9 +173,14 @@ func main() {
 	cfgPath := filepath.Join(baseDir, "config.yaml")
 
 	logPath := filepath.Join(baseDir, "qqbot.log")
-	if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
-		log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+	rotator, err := NewRotatingFileWriter(logPath, 5*1024*1024, 1)
+	if err == nil {
+		log.SetOutput(io.MultiWriter(os.Stdout, rotator))
+		defer rotator.Close()
 	}
+
+	// 启动时清理超过 10 分钟的临时残留文件
+	handler.CleanExpiredTempDirs(filepath.Join(baseDir, "tmp"), 10*time.Minute)
 
 	app, err := NewApp(cfgPath)
 	if err != nil {

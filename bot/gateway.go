@@ -329,6 +329,11 @@ func (gm *GatewayManager) handleDispatch(ctx context.Context, in payload) {
 			gm.mu.Unlock()
 			gm.setStatus(StatusConnected, "")
 			log.Printf("[QQBot-Gateway] 机器人认证就绪！已连接灵魂: 机器人名称=%s, ID=%s", ready.User.Username, ready.User.ID)
+
+			go func() {
+				time.Sleep(1 * time.Second)
+				_ = gm.client.SyncCommandPanel(context.Background())
+			}()
 		}
 		return
 	}
