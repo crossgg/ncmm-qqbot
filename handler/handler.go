@@ -48,7 +48,9 @@ func NewHandler(client *bot.Client, cfgGetter ConfigGetter) *Handler {
 }
 
 func (h *Handler) replyText(ctx context.Context, openID, text, msgID string) {
-	resp, err := h.client.SendC2CMessage(ctx, openID, text, msgID)
+	sendCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resp, err := h.client.SendC2CMessage(sendCtx, openID, text, msgID)
 	if err != nil {
 		log.Printf("[QQBot-Handler] 发送消息给 %s 失败: %v", openID, err)
 	} else if resp != nil {

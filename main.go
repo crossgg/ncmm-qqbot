@@ -82,11 +82,15 @@ func (ha *handlerAdapter) Save(d *handler.ConfigData) error {
 		NCMMHome:     d.NCMMHome,
 		NCMMExe:      d.NCMMExe,
 	}
+	oldCfg := ha.app.cm.Get()
 	if err := ha.app.cm.Save(newCfg); err != nil {
 		return err
 	}
-	ha.app.botCli.UpdateCredentials(newCfg.AppID, newCfg.ClientSecret)
-	ha.app.Restart(context.Background())
+	// 仅当 AppID 或 ClientSecret 发生变更时才更新凭据并重启 Gateway
+	if oldCfg.AppID != newCfg.AppID || oldCfg.ClientSecret != newCfg.ClientSecret {
+		ha.app.botCli.UpdateCredentials(newCfg.AppID, newCfg.ClientSecret)
+		go ha.app.Restart(context.Background())
+	}
 	return nil
 }
 
