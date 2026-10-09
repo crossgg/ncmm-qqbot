@@ -47,51 +47,69 @@ func NewHandler(client *bot.Client, cfgGetter ConfigGetter) *Handler {
 	}
 }
 
+func (h *Handler) replyText(ctx context.Context, openID, text, msgID string) {
+	resp, err := h.client.SendC2CMessage(ctx, openID, text, msgID)
+	if err != nil {
+		log.Printf("[QQBot-Handler] 发送消息给 %s 失败: %v", openID, err)
+	} else if resp != nil {
+		log.Printf("[QQBot-Handler] 发送消息给 %s 成功 (msgID=%s, respID=%s)", openID, msgID, resp.ID)
+	}
+}
+
 func (h *Handler) HandleMessage(ctx context.Context, msg *bot.C2CMessage) {
 	senderOpenID := msg.Author.UserOpenID
 	content := strings.TrimSpace(msg.Content)
 	msgID := msg.ID
 
+	log.Printf("[QQBot-Handler] 收到来自用户 %s 的私聊消息: %s (msgID: %s)", senderOpenID, content, msgID)
+
 	cfg := h.cfgGetter.Get()
 	adminID := strings.TrimSpace(cfg.AdminOpenID)
 
-	// 1. 处理无需管理员权限的基础指令
-	if strings.EqualFold(content, "/myid") || strings.EqualFold(content, "id") {
-		resp := fmt.Sprintf("您的 QQ OpenID 为：\n%s\n\n", senderOpenID)
+	// 1. 查询 OpenID 指令
+	if strings.EqualFold(content, "/myid") || strings.EqualFold(content, "id") || strings.EqualFold(content, "/id") || strings.EqualFold(content, "whoami") {
+		resp := fmt.Sprintf("你的 OpenID：\n%s\n\n", senderOpenID)
 		if adminID == "" {
-			resp += "⚠️ 当前系统尚未绑定管理员。\n您可以回复 /bind 将此账号设为管理员，或在 Web 管理面板在线保存。"
+			resp += "⚠️ 当前系统尚未绑定管理员。\n发送 /bind 可将此账号设为管理员，或在 NCMM Web 插件面板中填入该 OpenID。"
 		} else if adminID == senderOpenID {
-			resp += "✅ 您是当前系统的认证管理员。"
+			resp += "✅ 您是当前系统的认证管理员。\n发送 /help 查看所有可用功能指令。"
 		} else {
 			resp += "🔒 您不是当前系统的管理员。"
 		}
-		_, _ = h.client.SendC2CMessage(ctx, senderOpenID, resp, msgID)
+		h.replyText(ctx, senderOpenID, resp, msgID)
 		return
 	}
 
 	// 2. 绑定管理员指令
 	if strings.EqualFold(content, "/bind") {
 		if adminID != "" && adminID != senderOpenID {
-			_, _ = h.client.SendC2CMessage(ctx, senderOpenID, "❌ 系统已绑定其他管理员，如需重置请访问 Web 面板。", msgID)
+			h.replyText(ctx, senderOpenID, "❌ 系统已绑定其他管理员，如需重置请在 NCMM Web 插件面板中修改。", msgID)
 			return
 		}
 		newCfg := cfg
 		newCfg.AdminOpenID = senderOpenID
 		if err := h.cfgGetter.Save(&newCfg); err != nil {
-			_, _ = h.client.SendC2CMessage(ctx, senderOpenID, "❌ 绑定管理员失败: "+err.Error(), msgID)
+			h.replyText(ctx, senderOpenID, "❌ 绑定管理员失败: "+err.Error(), msgID)
 			return
 		}
-		_, _ = h.client.SendC2CMessage(ctx, senderOpenID, "🎉 恭喜！已成功将您绑定为管理员！\n发送 /help 查看所有可用指令。", msgID)
+		h.replyText(ctx, senderOpenID, fmt.Sprintf("🎉 恭喜！已成功将您的账号绑定为管理员！\n你的 OpenID：\n%s\n\n发送 /help 查看所有可用功能指令。", senderOpenID), msgID)
 		return
 	}
 
-	// 3. 管理员鉴权：若已设置管理员且非管理员发来消息，则拒绝执行敏感指令
-	if adminID != "" && adminID != senderOpenID {
-		_, _ = h.client.SendC2CMessage(ctx, senderOpenID, "🔒 权限不足：只有管理员可使用此机器人的控制功能。", msgID)
+	// 3. 若尚未绑定管理员，任何消息均提示 OpenID 与绑定方法（类似 qbot-push 体验）
+	if adminID == "" {
+		welcome := fmt.Sprintf("👋 收到您的消息！\n你的 OpenID：\n%s\n\n⚠️ 当前系统尚未绑定管理员：\n• 发送 /bind 立即绑定当前账号为管理员\n• 发送 /help 查看支持的指令与功能\n• 或在 NCMM Web 插件面板中直接保存管理员 OpenID", senderOpenID)
+		h.replyText(ctx, senderOpenID, welcome, msgID)
 		return
 	}
 
-	// 4. 指令路由
+	// 4. 管理员鉴权：若已设置管理员且非管理员发来消息，则拒绝执行并告知其 OpenID
+	if adminID != senderOpenID {
+		h.replyText(ctx, senderOpenID, fmt.Sprintf("你的 OpenID：\n%s\n\n🔒 权限不足：当前系统已绑定其他管理员，您无法使用控制功能。\n如需绑定此账号，请在 NCMM Web 插件面板中修改管理员 OpenID。", senderOpenID), msgID)
+		return
+	}
+
+	// 5. 管理员指令路由
 	lower := strings.ToLower(content)
 	switch {
 	case lower == "/help" || lower == "help" || lower == "帮助" || lower == "/菜单":
@@ -110,8 +128,8 @@ func (h *Handler) HandleMessage(ctx context.Context, msg *bot.C2CMessage) {
 		h.handleCookieUpdate(ctx, senderOpenID, msgID, content)
 
 	default:
-		reply := "🤖 收到您的指令。发送 /help 可查看功能菜单，发送 /myid 可查看身份标识。"
-		_, _ = h.client.SendC2CMessage(ctx, senderOpenID, reply, msgID)
+		reply := fmt.Sprintf("🤖 收到指令: %s\n你的 OpenID：\n%s\n\n发送 /help 查看可用功能，发送 /status 查看当前运行状态。", content, senderOpenID)
+		h.replyText(ctx, senderOpenID, reply, msgID)
 	}
 }
 
@@ -130,7 +148,7 @@ func (h *Handler) handleHelp(ctx context.Context, openID, msgID string) {
 • /help   ：查看本帮助菜单
 
 🌐 管理面板：访问本插件 Web 页面在线维护配置。`
-	_, _ = h.client.SendC2CMessage(ctx, openID, menu, msgID)
+	h.replyText(ctx, openID, menu, msgID)
 }
 
 func (h *Handler) handleStatus(ctx context.Context, openID, msgID string) {
@@ -146,13 +164,13 @@ func (h *Handler) handleStatus(ctx context.Context, openID, msgID string) {
 	}
 
 	if !fileExists(cfgPath) {
-		_, _ = h.client.SendC2CMessage(ctx, openID, fmt.Sprintf("⚠️ 未在 %s 找到 config.yaml 配置文件", ncmmHome), msgID)
+		h.replyText(ctx, openID, fmt.Sprintf("⚠️ 未在 %s 找到 config.yaml 配置文件", ncmmHome), msgID)
 		return
 	}
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "读取 config.yaml 失败: "+err.Error(), msgID)
+		h.replyText(ctx, openID, "读取 config.yaml 失败: "+err.Error(), msgID)
 		return
 	}
 
@@ -189,14 +207,14 @@ func (h *Handler) handleStatus(ctx context.Context, openID, msgID string) {
 		sb.WriteString(fmt.Sprintf(" [%d] %s (%s)\n", i+1, sec, secStatus))
 	}
 
-	_, _ = h.client.SendC2CMessage(ctx, openID, sb.String(), msgID)
+	h.replyText(ctx, openID, sb.String(), msgID)
 }
 
 func (h *Handler) handleRunTask(ctx context.Context, openID, msgID, content string) {
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "❌ 未找到 ncmm 可执行文件路径，请在 Web 面板中配置 ncmm_exe", msgID)
+		h.replyText(ctx, openID, "❌ 未找到 ncmm 可执行文件路径，请在 Web 面板中配置 ncmm_exe", msgID)
 		return
 	}
 
@@ -206,7 +224,7 @@ func (h *Handler) handleRunTask(ctx context.Context, openID, msgID, content stri
 		args = append(args, parts[1:]...)
 	}
 
-	_, _ = h.client.SendC2CMessage(ctx, openID, fmt.Sprintf("🚀 开始执行命令: ncmm %s\n任务已在后台启动，请稍候...", strings.Join(args, " ")), msgID)
+	h.replyText(ctx, openID, fmt.Sprintf("🚀 开始执行命令: ncmm %s\n任务已在后台启动，请稍候...", strings.Join(args, " ")), msgID)
 
 	go func() {
 		cmdCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -227,10 +245,10 @@ func (h *Handler) handleRunTask(ctx context.Context, openID, msgID, content stri
 
 		if err != nil {
 			msg := fmt.Sprintf("❌ 任务执行完成但有报错:\n%v\n\n日志摘要:\n%s", err, outStr)
-			_, _ = h.client.SendC2CMessage(context.Background(), openID, msg, "")
+			h.replyText(context.Background(), openID, msg, "")
 		} else {
 			msg := fmt.Sprintf("✅ 任务执行成功完成！\n\n日志摘要:\n%s", outStr)
-			_, _ = h.client.SendC2CMessage(context.Background(), openID, msg, "")
+			h.replyText(context.Background(), openID, msg, "")
 		}
 	}()
 }
@@ -247,19 +265,19 @@ type LoginJSONResult struct {
 func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content string) {
 	cookieStr := extractCookieString(content)
 	if cookieStr == "" {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "❌ 无法提取有效 Cookie，请确保包含 MUSIC_U 内容。", msgID)
+		h.replyText(ctx, openID, "❌ 无法提取有效 Cookie，请确保包含 MUSIC_U 内容。", msgID)
 		return
 	}
 
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "❌ 未配置 ncmm 可执行文件，无法更新 Cookie", msgID)
+		h.replyText(ctx, openID, "❌ 未配置 ncmm 可执行文件，无法更新 Cookie", msgID)
 		return
 	}
 
 	// 1. 临时预校验：使用 --no-config-write 与 --json-result 探测该 Cookie 对应的 UID 与昵称
-	_, _ = h.client.SendC2CMessage(ctx, openID, "🔍 正在连接网易云验证 Cookie 并自动识别账号身份...", msgID)
+	h.replyText(ctx, openID, "🔍 正在连接网易云验证 Cookie 并自动识别账号身份...", msgID)
 
 	probeCmd := exec.CommandContext(ctx, ncmmExe, "login", "cookie", "--no-config-write", "--json-result", cookieStr)
 	probeCmd.Dir = cfg.NCMMHome
@@ -274,7 +292,7 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 		if errInfo == "" {
 			errInfo = probeOut.String()
 		}
-		_, _ = h.client.SendC2CMessage(ctx, openID, fmt.Sprintf("❌ Cookie 校验失败: %v\n%s", err, errInfo), msgID)
+		h.replyText(ctx, openID, fmt.Sprintf("❌ Cookie 校验失败: %v\n%s", err, errInfo), msgID)
 		return
 	}
 
@@ -293,7 +311,7 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 	}
 
 	if !foundJSON || res.UID == 0 {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "❌ 登录成功但无法解析账号信息: \n"+probeOut.String(), msgID)
+		h.replyText(ctx, openID, "❌ 登录成功但无法解析账号信息: \n"+probeOut.String(), msgID)
 		return
 	}
 
@@ -313,7 +331,7 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 	saveCmd := exec.CommandContext(ctx, ncmmExe, finalArgs...)
 	saveCmd.Dir = cfg.NCMMHome
 	if err := saveCmd.Run(); err != nil {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "❌ 保存 Cookie 到系统失败: "+err.Error(), msgID)
+		h.replyText(ctx, openID, "❌ 保存 Cookie 到系统失败: "+err.Error(), msgID)
 		return
 	}
 
@@ -324,7 +342,7 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 
 	reply := fmt.Sprintf("🎉 Cookie 自动识别并更新成功！\n------------------------\n身份类型: %s\n用户昵称: %s\n用户 UID: %d\n落盘位置: %s",
 		accountType, res.Nickname, res.UID, res.AccountPath)
-	_, _ = h.client.SendC2CMessage(ctx, openID, reply, msgID)
+	h.replyText(ctx, openID, reply, msgID)
 }
 
 func (h *Handler) detectAccountTarget(ncmmHome string, uid int64) (isMain bool, targetFile string) {
@@ -397,7 +415,7 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 	h.loginMu.Lock()
 	if h.isLogining {
 		h.loginMu.Unlock()
-		_, _ = h.client.SendC2CMessage(ctx, openID, "⚠️ 当前已有一个扫码登录会话正在进行中，请在手机上确认或稍候重试。", msgID)
+		h.replyText(ctx, openID, "⚠️ 当前已有一个扫码登录会话正在进行中，请在手机上确认或稍候重试。", msgID)
 		return
 	}
 	h.isLogining = true
@@ -412,18 +430,18 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "❌ 未配置 ncmm 可执行文件，无法发起扫码登录", msgID)
+		h.replyText(ctx, openID, "❌ 未配置 ncmm 可执行文件，无法发起扫码登录", msgID)
 		return
 	}
 
 	tempDir, err := os.MkdirTemp("", "ncmm-qq-qrcode-*")
 	if err != nil {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "创建临时目录失败: "+err.Error(), msgID)
+		h.replyText(ctx, openID, "创建临时目录失败: "+err.Error(), msgID)
 		return
 	}
 	defer os.RemoveAll(tempDir)
 
-	_, _ = h.client.SendC2CMessage(ctx, openID, "📱 正在生成网易云音乐登录二维码，请稍候...", msgID)
+	h.replyText(ctx, openID, "📱 正在生成网易云音乐登录二维码，请稍候...", msgID)
 
 	qrCmdCtx, qrCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer qrCancel()
@@ -437,7 +455,7 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 	cmd.Stderr = &stdoutBuf
 
 	if err := cmd.Start(); err != nil {
-		_, _ = h.client.SendC2CMessage(ctx, openID, "❌ 启动扫码命令失败: "+err.Error(), msgID)
+		h.replyText(ctx, openID, "❌ 启动扫码命令失败: "+err.Error(), msgID)
 		return
 	}
 
@@ -474,12 +492,12 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 	if codeKey != "" {
 		hintMsg += fmt.Sprintf("\n\n若上方未显示图片，请点击扫码授权链接：\nhttps://music.163.com/login?codekey=%s", codeKey)
 	}
-	_, _ = h.client.SendC2CMessage(ctx, openID, hintMsg, msgID)
+	h.replyText(ctx, openID, hintMsg, msgID)
 
 	// 等待扫码完成
 	waitErr := cmd.Wait()
 	if waitErr != nil {
-		_, _ = h.client.SendC2CMessage(context.Background(), openID, "⏳ 扫码登录已超时或已取消。", "")
+		h.replyText(context.Background(), openID, "⏳ 扫码登录已超时或已取消。", "")
 		return
 	}
 
@@ -493,7 +511,7 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 	}
 
 	successMsg := fmt.Sprintf("🎉 扫码登录成功！\n账号【%s】Cookie 已更新并自动回写到系统配置中！", nickname)
-	_, _ = h.client.SendC2CMessage(context.Background(), openID, successMsg, "")
+	h.replyText(context.Background(), openID, successMsg, "")
 }
 
 func isCookieString(s string) bool {

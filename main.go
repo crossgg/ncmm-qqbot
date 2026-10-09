@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -165,6 +166,11 @@ func main() {
 	exeDir, _ := os.Executable()
 	baseDir := filepath.Dir(exeDir)
 	cfgPath := filepath.Join(baseDir, "config.yaml")
+
+	logPath := filepath.Join(baseDir, "qqbot.log")
+	if logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+	}
 
 	app, err := NewApp(cfgPath)
 	if err != nil {

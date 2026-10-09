@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,8 @@ type C2CMessage struct {
 
 type C2CAuthor struct {
 	UserOpenID string `json:"user_openid"`
+	Username   string `json:"username"`
+	Bot        bool   `json:"bot"`
 }
 
 type MessageHandler func(ctx context.Context, msg *C2CMessage)
@@ -45,15 +48,19 @@ type GatewayManager struct {
 	sessionID string
 	lastSeq   int64
 
+	replyMu   sync.Mutex
+	repliedAt map[string]time.Time
+
 	cancelFunc context.CancelFunc
 	running    bool
 }
 
 func NewGatewayManager(client *Client, handler MessageHandler) *GatewayManager {
 	return &GatewayManager{
-		client:  client,
-		handler: handler,
-		status:  StatusDisconnected,
+		client:    client,
+		handler:   handler,
+		status:    StatusDisconnected,
+		repliedAt: make(map[string]time.Time),
 	}
 }
 
@@ -97,7 +104,7 @@ func (gm *GatewayManager) setStatus(s GatewayStatus, errStr string) {
 
 type payload struct {
 	Op int             `json:"op"`
-	D  json.RawMessage `json:"d,omitempty"`
+	D  json.RawMessage `json:"d"`
 	S  *int64          `json:"s,omitempty"`
 	T  string          `json:"t,omitempty"`
 }
@@ -116,6 +123,7 @@ type readyData struct {
 }
 
 func (gm *GatewayManager) runLoop(ctx context.Context) {
+	backoff := 2 * time.Second
 	for {
 		select {
 		case <-ctx.Done():
@@ -126,16 +134,48 @@ func (gm *GatewayManager) runLoop(ctx context.Context) {
 
 		err := gm.connectAndListen(ctx)
 		if err != nil {
-			log.Printf("[QQBot-Gateway] 连接断开: %v", err)
+			if ctx.Err() != nil {
+				gm.setStatus(StatusDisconnected, "")
+				return
+			}
+			log.Printf("[QQBot-Gateway] 连接断开: %v，%s 后自动重连...", err, backoff)
 			gm.setStatus(StatusError, err.Error())
+		} else {
+			backoff = 2 * time.Second
 		}
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second): // 5秒后重试
+		case <-time.After(backoff):
+		}
+
+		if backoff < 30*time.Second {
+			backoff *= 2
 		}
 	}
+}
+
+func (gm *GatewayManager) markReply(messageID string) bool {
+	if messageID == "" {
+		return true
+	}
+	now := time.Now()
+	gm.replyMu.Lock()
+	defer gm.replyMu.Unlock()
+	if gm.repliedAt == nil {
+		gm.repliedAt = make(map[string]time.Time)
+	}
+	for id, t := range gm.repliedAt {
+		if now.Sub(t) > time.Hour {
+			delete(gm.repliedAt, id)
+		}
+	}
+	if _, exists := gm.repliedAt[messageID]; exists {
+		return false
+	}
+	gm.repliedAt[messageID] = now
+	return true
 }
 
 func (gm *GatewayManager) connectAndListen(ctx context.Context) error {
@@ -162,7 +202,20 @@ func (gm *GatewayManager) connectAndListen(ctx context.Context) error {
 		return fmt.Errorf("获取鉴权 Token 失败: %w", err)
 	}
 
-	var heartbeatInterval time.Duration = 45 * time.Second
+	var writeMu sync.Mutex
+	safeWriteJSON := func(v interface{}) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(v)
+	}
+
+	conn.SetPingHandler(func(appData string) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
+	})
+
+	var heartbeatInterval time.Duration = 40 * time.Second
 	heartbeatStop := make(chan struct{})
 	defer close(heartbeatStop)
 
@@ -172,26 +225,32 @@ func (gm *GatewayManager) connectAndListen(ctx context.Context) error {
 		return fmt.Errorf("读取初始 Hello 包失败: %w", err)
 	}
 
-	if p.Op == 10 {
-		var hello helloData
-		if err := json.Unmarshal(p.D, &hello); err == nil && hello.HeartbeatInterval > 0 {
-			heartbeatInterval = time.Duration(hello.HeartbeatInterval) * time.Millisecond
-		}
+	if p.Op != 10 {
+		return fmt.Errorf("期望 Hello (Op 10)，收到 Op %d: %s", p.Op, string(p.D))
+	}
+
+	var hello helloData
+	if err := json.Unmarshal(p.D, &hello); err == nil && hello.HeartbeatInterval > 0 {
+		heartbeatInterval = time.Duration(hello.HeartbeatInterval) * time.Millisecond
 	}
 
 	// 发送 Identify (OpCode 2)
 	// 33554432 (1 << 25) 订阅 C2C 私聊事件
 	identifyData := map[string]interface{}{
 		"token":   "QQBot " + token,
-		"intents": (1 << 25),
+		"intents": 1 << 25,
 		"shard":   []int{0, 1},
+		"properties": map[string]string{
+			"$os":      runtime.GOOS,
+			"$browser": "ncmm-qqbot",
+			"$device":  "ncmm-qqbot",
+		},
 	}
-	identifyBytes, _ := json.Marshal(identifyData)
-	identifyPayload := payload{
-		Op: 2,
-		D:  identifyBytes,
+	identifyPayload := map[string]interface{}{
+		"op": 2,
+		"d":  identifyData,
 	}
-	if err := conn.WriteJSON(identifyPayload); err != nil {
+	if err := safeWriteJSON(identifyPayload); err != nil {
 		return fmt.Errorf("发送 Identify 失败: %w", err)
 	}
 
@@ -210,21 +269,20 @@ func (gm *GatewayManager) connectAndListen(ctx context.Context) error {
 				seq := gm.lastSeq
 				gm.mu.RUnlock()
 
-				var seqData json.RawMessage
+				var hb map[string]interface{}
 				if seq > 0 {
-					seqData = []byte(fmt.Sprintf("%d", seq))
+					hb = map[string]interface{}{"op": 1, "d": seq}
+				} else {
+					hb = map[string]interface{}{"op": 1, "d": nil}
 				}
-				hb := payload{Op: 1, D: seqData}
-				if err := conn.WriteJSON(hb); err != nil {
+				if err := safeWriteJSON(hb); err != nil {
 					log.Printf("[QQBot-Gateway] 发送心跳失败: %v", err)
+					_ = conn.Close()
 					return
 				}
 			}
 		}
 	}()
-
-	gm.setStatus(StatusConnected, "")
-	log.Printf("[QQBot-Gateway] WebSocket 网关已成功连接！正在监听私聊事件...")
 
 	// 循环接收消息
 	for {
@@ -269,7 +327,8 @@ func (gm *GatewayManager) handleDispatch(ctx context.Context, in payload) {
 			gm.mu.Lock()
 			gm.sessionID = ready.SessionID
 			gm.mu.Unlock()
-			log.Printf("[QQBot-Gateway] 机器人认证就绪: 机器人名称=%s, ID=%s", ready.User.Username, ready.User.ID)
+			gm.setStatus(StatusConnected, "")
+			log.Printf("[QQBot-Gateway] 机器人认证就绪！已连接灵魂: 机器人名称=%s, ID=%s", ready.User.Username, ready.User.ID)
 		}
 		return
 	}
@@ -277,6 +336,13 @@ func (gm *GatewayManager) handleDispatch(ctx context.Context, in payload) {
 	if eventType == "C2C_MESSAGE_CREATE" {
 		var msg C2CMessage
 		if err := json.Unmarshal(in.D, &msg); err == nil {
+			if msg.Author.Bot {
+				return
+			}
+			if !gm.markReply(msg.ID) {
+				log.Printf("[QQBot-Gateway] 忽略重复投递消息: %s", msg.ID)
+				return
+			}
 			if gm.handler != nil {
 				go gm.handler(ctx, &msg)
 			}

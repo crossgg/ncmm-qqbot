@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	TokenURL   = "https://bots.qq.com/app/getAppAccessToken"
-	BaseAPIURL = "https://api.sgroup.qq.com"
+	TokenURL   = "https://api.bot.qq.com/app/getAppAccessToken"
+	BaseAPIURL = "https://api.bot.qq.com"
 )
 
 type Client struct {
@@ -181,10 +181,13 @@ func (c *Client) SendC2CMessage(ctx context.Context, openID, content, msgID stri
 	}
 
 	apiURL := fmt.Sprintf("%s/v2/users/%s/messages", BaseAPIURL, openID)
-	reqData := SendMessageReq{
-		Content: content,
-		MsgType: 0,
-		MsgID:   msgID,
+	reqData := map[string]interface{}{
+		"content":  content,
+		"msg_type": 0,
+	}
+	if msgID != "" {
+		reqData["msg_id"] = msgID
+		reqData["msg_seq"] = 1
 	}
 	data, _ := json.Marshal(reqData)
 
@@ -229,6 +232,7 @@ func (c *Client) SendC2CImage(ctx context.Context, openID string, imageBytes []b
 	_ = w.WriteField("srv_send_msg", "true")
 	if msgID != "" {
 		_ = w.WriteField("msg_id", msgID)
+		_ = w.WriteField("msg_seq", "1")
 	}
 
 	part, err := w.CreateFormFile("file_data", "qrcode.png")
