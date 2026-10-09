@@ -3,11 +3,13 @@ package bot
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -237,52 +239,177 @@ func (c *Client) SendC2CMessage(ctx context.Context, openID, content, msgID stri
 	return &res, nil
 }
 
-// SendC2CImage 发送图片给指定私聊用户（支持 multipart 上传富媒体并由服务端代发）
+// SendC2CImage 通过分片预签名上传模式发送富媒体图片给指定私聊用户
 func (c *Client) SendC2CImage(ctx context.Context, openID string, imageBytes []byte, msgID string) error {
 	token, err := c.GetAccessToken(ctx, false)
 	if err != nil {
 		return err
 	}
 
-	apiURL := fmt.Sprintf("%s/v2/users/%s/files", BaseAPIURL, openID)
-
-	var b bytes.Buffer
-	w := multipart.NewWriter(&b)
-
-	// file_type: 1 为图片
-	_ = w.WriteField("file_type", "1")
-	// srv_send_msg: true 让官方服务器直接将上传的富媒体发送到聊天窗口
-	_ = w.WriteField("srv_send_msg", "true")
-	if msgID != "" {
-		_ = w.WriteField("msg_id", msgID)
-		_ = w.WriteField("msg_seq", strconv.Itoa(c.nextMsgSeq(msgID)))
+	fileSize := len(imageBytes)
+	if fileSize == 0 {
+		return fmt.Errorf("图片数据为空")
 	}
 
-	part, err := w.CreateFormFile("file_data", "qrcode.png")
-	if err != nil {
-		return fmt.Errorf("创建表单文件失败: %w", err)
-	}
-	if _, err := part.Write(imageBytes); err != nil {
-		return fmt.Errorf("写入图片数据失败: %w", err)
-	}
-	w.Close()
+	md5Hash := md5.Sum(imageBytes)
+	md5Hex := hex.EncodeToString(md5Hash[:])
 
-	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, &b)
+	sha1Hash := sha1.Sum(imageBytes)
+	sha1Hex := hex.EncodeToString(sha1Hash[:])
+
+	// 1. Upload Prepare
+	prepareURL := fmt.Sprintf("%s/v2/users/%s/upload_prepare", BaseAPIURL, openID)
+	prepareReqBody := map[string]interface{}{
+		"file_type": 1, // 1: 图片
+		"file_size": strconv.Itoa(fileSize),
+		"file_name": "qrcode.png",
+		"md5":       md5Hex,
+		"sha1":      sha1Hex,
+		"md5_10m":   md5Hex,
+	}
+	prepJSON, _ := json.Marshal(prepareReqBody)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", prepareURL, bytes.NewReader(prepJSON))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "QQBot "+token)
-	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("上传富媒体失败: %w", err)
+		return fmt.Errorf("请求 upload_prepare 失败: %w", err)
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	prepRespBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("发送图片返回状态码 %d: %s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("upload_prepare 返回状态码 %d: %s", resp.StatusCode, string(prepRespBytes))
+	}
+
+	var prepRes struct {
+		UploadID string `json:"upload_id"`
+		Parts    []struct {
+			Index        int    `json:"index"`
+			PresignedURL string `json:"presigned_url"`
+			BlockSize    string `json:"block_size"`
+		} `json:"parts"`
+	}
+	if err := json.Unmarshal(prepRespBytes, &prepRes); err != nil {
+		return fmt.Errorf("解析 upload_prepare 响应失败: %w", err)
+	}
+	if prepRes.UploadID == "" || len(prepRes.Parts) == 0 {
+		return fmt.Errorf("upload_prepare 返回数据不完整: %s", string(prepRespBytes))
+	}
+
+	// 2. PUT to presigned_url (COS 预签名 URL 不带 QQBot Authorization Header)
+	putReq, err := http.NewRequestWithContext(ctx, "PUT", prepRes.Parts[0].PresignedURL, bytes.NewReader(imageBytes))
+	if err != nil {
+		return fmt.Errorf("创建 PUT 请求失败: %w", err)
+	}
+	putReq.Header.Set("Content-Type", "image/png")
+	putReq.Header.Set("Content-Length", strconv.Itoa(fileSize))
+
+	putResp, err := c.httpClient.Do(putReq)
+	if err != nil {
+		return fmt.Errorf("PUT 上传分片数据失败: %w", err)
+	}
+	defer putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK && putResp.StatusCode != http.StatusCreated && putResp.StatusCode != http.StatusNoContent {
+		putRespBytes, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("PUT 上传分片返回状态码 %d: %s", putResp.StatusCode, string(putRespBytes))
+	}
+
+	// 3. Upload Part Finish
+	finishURL := fmt.Sprintf("%s/v2/users/%s/upload_part_finish", BaseAPIURL, openID)
+	finishReqBody := map[string]interface{}{
+		"upload_id":  prepRes.UploadID,
+		"part_index": 0,
+		"block_size": strconv.Itoa(fileSize),
+		"md5":        md5Hex,
+	}
+	finJSON, _ := json.Marshal(finishReqBody)
+	finReq, err := http.NewRequestWithContext(ctx, "POST", finishURL, bytes.NewReader(finJSON))
+	if err != nil {
+		return err
+	}
+	finReq.Header.Set("Authorization", "QQBot "+token)
+	finReq.Header.Set("Content-Type", "application/json")
+
+	finResp, err := c.httpClient.Do(finReq)
+	if err != nil {
+		return fmt.Errorf("请求 upload_part_finish 失败: %w", err)
+	}
+	defer finResp.Body.Close()
+	if finResp.StatusCode != http.StatusOK && finResp.StatusCode != http.StatusNoContent && finResp.StatusCode != http.StatusCreated {
+		finRespBytes, _ := io.ReadAll(finResp.Body)
+		return fmt.Errorf("upload_part_finish 返回状态码 %d: %s", finResp.StatusCode, string(finRespBytes))
+	}
+
+	// 4. Files 合并获取 file_info
+	filesURL := fmt.Sprintf("%s/v2/users/%s/files", BaseAPIURL, openID)
+	filesReqBody := map[string]interface{}{
+		"file_type":    1,
+		"srv_send_msg": false,
+		"file_name":    "qrcode.png",
+		"upload_id":    prepRes.UploadID,
+	}
+	filesJSON, _ := json.Marshal(filesReqBody)
+	filesReq, err := http.NewRequestWithContext(ctx, "POST", filesURL, bytes.NewReader(filesJSON))
+	if err != nil {
+		return err
+	}
+	filesReq.Header.Set("Authorization", "QQBot "+token)
+	filesReq.Header.Set("Content-Type", "application/json")
+
+	filesResp, err := c.httpClient.Do(filesReq)
+	if err != nil {
+		return fmt.Errorf("请求 files 合并失败: %w", err)
+	}
+	defer filesResp.Body.Close()
+	filesRespBytes, _ := io.ReadAll(filesResp.Body)
+	if filesResp.StatusCode != http.StatusOK && filesResp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("files 合并返回状态码 %d: %s", filesResp.StatusCode, string(filesRespBytes))
+	}
+
+	var filesRes struct {
+		FileInfo string `json:"file_info"`
+	}
+	if err := json.Unmarshal(filesRespBytes, &filesRes); err != nil {
+		return fmt.Errorf("解析 files 响应失败: %w", err)
+	}
+	if filesRes.FileInfo == "" {
+		return fmt.Errorf("files 返回 file_info 为空: %s", string(filesRespBytes))
+	}
+
+	// 5. 调用发送单聊富媒体消息接口 (msg_type: 7)
+	msgURL := fmt.Sprintf("%s/v2/users/%s/messages", BaseAPIURL, openID)
+	msgReqData := map[string]interface{}{
+		"msg_type": 7,
+		"media": map[string]string{
+			"file_info": filesRes.FileInfo,
+		},
+	}
+	if msgID != "" {
+		msgReqData["msg_id"] = msgID
+		msgReqData["msg_seq"] = c.nextMsgSeq(msgID)
+	}
+	msgJSON, _ := json.Marshal(msgReqData)
+	msgReq, err := http.NewRequestWithContext(ctx, "POST", msgURL, bytes.NewReader(msgJSON))
+	if err != nil {
+		return err
+	}
+	msgReq.Header.Set("Authorization", "QQBot "+token)
+	msgReq.Header.Set("Content-Type", "application/json")
+
+	msgResp, err := c.httpClient.Do(msgReq)
+	if err != nil {
+		return fmt.Errorf("发送富媒体消息失败: %w", err)
+	}
+	defer msgResp.Body.Close()
+	msgRespBytes, _ := io.ReadAll(msgResp.Body)
+	if msgResp.StatusCode != http.StatusOK && msgResp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("发送富媒体消息返回状态码 %d: %s", msgResp.StatusCode, string(msgRespBytes))
 	}
 
 	return nil

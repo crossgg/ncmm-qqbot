@@ -14,11 +14,21 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type MessageAttachment struct {
+	URL         string `json:"url"`
+	Filename    string `json:"filename"`
+	Size        int64  `json:"size,omitempty"`
+	Width       int    `json:"width,omitempty"`
+	Height      int    `json:"height,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
 type C2CMessage struct {
-	ID        string    `json:"id"`
-	Content   string    `json:"content"`
-	Timestamp string    `json:"timestamp"`
-	Author    C2CAuthor `json:"author"`
+	ID          string              `json:"id"`
+	Content     string              `json:"content"`
+	Timestamp   string              `json:"timestamp"`
+	Author      C2CAuthor           `json:"author"`
+	Attachments []MessageAttachment `json:"attachments,omitempty"`
 }
 
 type C2CAuthor struct {

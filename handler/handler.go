@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,6 +114,12 @@ func (h *Handler) HandleMessage(ctx context.Context, msg *bot.C2CMessage) {
 	}
 
 	// 5. 管理员指令路由
+	// 5.1 优先检测是否附带了文件附件 (例如直接向机器人发送包含 Cookie 的 .txt/.json 文件)
+	if len(msg.Attachments) > 0 {
+		h.handleAttachment(ctx, senderOpenID, msgID, msg.Attachments)
+		return
+	}
+
 	lower := strings.ToLower(content)
 	switch {
 	case lower == "/help" || lower == "help" || lower == "帮助" || lower == "/菜单":
@@ -138,10 +146,11 @@ func (h *Handler) HandleMessage(ctx context.Context, msg *bot.C2CMessage) {
 func (h *Handler) handleHelp(ctx context.Context, openID, msgID string) {
 	menu := `📖【NCMM QQ 机器人功能菜单】
 ------------------------
-🔑 Cookie 更新与登录：
-• 直接发送 Cookie 文本：自动识别账号并更新
-• /login 或 /qrcode：获取网易云扫码登录二维码
-• /cookie <账号别名> <内容>：指定小号更新
+🔑 账号登录与 Cookie 更新：
+• /login 或 /qrcode  ：获取网易云登录二维码（扫码最便捷）
+• 发送文件（强烈推荐）：直接发送包含 Cookie 的【.txt/.json】文件，秒级解析并绑定
+• 发送文本          ：/cookie MUSIC_U=xxxxxx 或完整 Cookie
+• 指定小号更新      ：/cookie <账号别名> MUSIC_U=xxxxxx
 
 ⚡ 控制与查询：
 • /status ：查看各账号状态与配置文件
@@ -264,19 +273,93 @@ type LoginJSONResult struct {
 	Main        bool   `json:"main"`
 }
 
+func (h *Handler) handleAttachment(ctx context.Context, openID, msgID string, atts []bot.MessageAttachment) {
+	for _, att := range atts {
+		if att.URL == "" {
+			continue
+		}
+		log.Printf("[QQBot-Handler] 收到来自用户 %s 的附件: filename=%s, url=%s, size=%d", openID, att.Filename, att.URL, att.Size)
+
+		if att.Size > 1024*1024 {
+			h.replyText(ctx, openID, fmt.Sprintf("⚠️ 附件【%s】体积过大（超过 1MB），已跳过处理。", att.Filename), msgID)
+			continue
+		}
+
+		h.replyText(ctx, openID, fmt.Sprintf("📥 收到附件【%s】，正在下载并识别网易云 Cookie 凭据...", att.Filename), msgID)
+
+		fileBytes, err := downloadAttachment(ctx, att.URL)
+		if err != nil {
+			h.replyText(ctx, openID, fmt.Sprintf("❌ 下载附件【%s】失败: %v", att.Filename, err), msgID)
+			continue
+		}
+
+		fileText := strings.TrimSpace(string(fileBytes))
+		fileText = strings.TrimPrefix(fileText, "\xef\xbb\xbf") // 移除 UTF-8 BOM
+
+		if !isCookieString(fileText) {
+			h.replyText(ctx, openID, fmt.Sprintf("⚠️ 附件【%s】下载完成，但未检测到有效网易云 Cookie 凭据（请确认文件内容是否包含 MUSIC_U 等字段）。", att.Filename), msgID)
+			continue
+		}
+
+		var alias string
+		baseName := strings.TrimSuffix(att.Filename, filepath.Ext(att.Filename))
+		if strings.EqualFold(baseName, "main") {
+			alias = "main"
+		} else if strings.HasPrefix(strings.ToLower(baseName), "fan_") {
+			alias = baseName
+		}
+
+		h.processCookieString(ctx, openID, msgID, alias, fileText, fmt.Sprintf("文件【%s】", att.Filename))
+		return
+	}
+}
+
+func downloadAttachment(ctx context.Context, fileURL string) ([]byte, error) {
+	dlCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(dlCtx, "GET", fileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("下载文件返回 HTTP %d", resp.StatusCode)
+	}
+
+	lr := io.LimitReader(resp.Body, 512*1024)
+	return io.ReadAll(lr)
+}
+
 func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content string) {
 	alias, cookieStr := parseCookieInput(content)
 	if cookieStr == "" {
 		msg := "💡 Cookie 绑定与更新说明：\n" +
-			"直接发送 Cookie 字符串或使用以下指令：\n" +
+			"------------------------\n" +
+			"1️⃣ 发送文件（强烈推荐）：\n" +
+			"• 直接向机器人发送包含 Cookie 的【.txt】或【.json】文本文件\n" +
+			"• 彻底避免长文本密文被 QQ 平台安全策略拦截！\n\n" +
+			"2️⃣ 扫码登录（最便捷）：\n" +
+			"• 发送 /login 即可获取网易云登录二维码\n\n" +
+			"3️⃣ 发送文本：\n" +
 			"• 自动识别并保存: /cookie MUSIC_U=xxxxxx\n" +
 			"• 指定绑定为主账号: /cookie main MUSIC_U=xxxxxx\n" +
-			"• 指定绑定为副账号: /cookie 4265 MUSIC_U=xxxxxx\n\n" +
-			"⚠️ 提示: QQ 平台限制单条私聊长度（最大约 2000 字符）。若从浏览器复制的完整 Cookie 较长会被 QQ 拦截丢弃，请仅复制发送核心参数【MUSIC_U=...】即可！"
+			"• 指定绑定为副账号: /cookie 4265 MUSIC_U=xxxxxx"
 		h.replyText(ctx, openID, msg, msgID)
 		return
 	}
 
+	h.processCookieString(ctx, openID, msgID, alias, cookieStr, "文本指令")
+}
+
+func (h *Handler) processCookieString(ctx context.Context, openID, msgID, alias, cookieStr, sourceDesc string) {
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
@@ -285,9 +368,12 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 	}
 
 	// 1. 临时预校验：使用 --no-config-write 与 --json-result 探测该 Cookie 对应的 UID 与昵称
-	h.replyText(ctx, openID, "🔍 正在连接网易云验证 Cookie 并自动识别账号身份...", msgID)
+	h.replyText(ctx, openID, fmt.Sprintf("🔍 正在连接网易云验证来自%s的 Cookie 并自动识别账号身份...", sourceDesc), msgID)
 
-	probeCmd := exec.CommandContext(ctx, ncmmExe, "login", "cookie", "--no-config-write", "--json-result", cookieStr)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer probeCancel()
+
+	probeCmd := exec.CommandContext(probeCtx, ncmmExe, "login", "cookie", "--no-config-write", "--json-result", cookieStr)
 	probeCmd.Dir = cfg.NCMMHome
 
 	var probeOut, probeErr bytes.Buffer
@@ -351,7 +437,10 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 		finalArgs = []string{"login", "cookie", cookieStr}
 	}
 
-	saveCmd := exec.CommandContext(ctx, ncmmExe, finalArgs...)
+	saveCtx, saveCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer saveCancel()
+
+	saveCmd := exec.CommandContext(saveCtx, ncmmExe, finalArgs...)
 	saveCmd.Dir = cfg.NCMMHome
 	if err := saveCmd.Run(); err != nil {
 		h.replyText(ctx, openID, "❌ 保存 Cookie 到系统失败: "+err.Error(), msgID)
@@ -363,8 +452,8 @@ func (h *Handler) handleCookieUpdate(ctx context.Context, openID, msgID, content
 		accountType = "【辅助小号】"
 	}
 
-	reply := fmt.Sprintf("🎉 Cookie 自动识别并更新成功！\n------------------------\n身份类型: %s\n用户昵称: %s\n用户 UID: %d\n落盘位置: %s",
-		accountType, res.Nickname, res.UID, res.AccountPath)
+	reply := fmt.Sprintf("🎉 来自%s的 Cookie 自动识别并更新成功！\n------------------------\n身份类型: %s\n用户昵称: %s\n用户 UID: %d\n落盘位置: %s",
+		sourceDesc, accountType, res.Nickname, res.UID, res.AccountPath)
 	h.replyText(ctx, openID, reply, msgID)
 }
 
