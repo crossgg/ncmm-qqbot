@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,17 +38,66 @@ type ConfigData struct {
 	NCMMExe      string
 }
 
+type PhoneLoginSession struct {
+	OpenID      string
+	Cellphone   string
+	CountryCode int64
+	Target      string // 目标账号归属: "main" 或自定义如 "fan1.json"
+	Captcha     string // 缓存验证码供 8860 新昵称注册使用
+	Step        int    // 0: 等待输入验证码, 1: 等待输入新昵称(8860)
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
+}
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+type ExecRecord struct {
+	Command   string
+	Args      []string
+	StartTime time.Time
+	EndTime   time.Time
+	Duration  time.Duration
+	IsRunning bool
+	ExitCode  int
+	Output    string
+	Err       error
+	buf       *safeBuffer
+}
+
 type Handler struct {
 	client     *bot.Client
 	cfgGetter  ConfigGetter
 	loginMu    sync.Mutex
 	isLogining bool
+
+	phoneMu       sync.RWMutex
+	phoneSessions map[string]*PhoneLoginSession
+
+	execMu     sync.Mutex
+	activeExec *ExecRecord
+	lastExec   *ExecRecord
 }
 
 func NewHandler(client *bot.Client, cfgGetter ConfigGetter) *Handler {
 	return &Handler{
-		client:    client,
-		cfgGetter: cfgGetter,
+		client:        client,
+		cfgGetter:     cfgGetter,
+		phoneSessions: make(map[string]*PhoneLoginSession),
 	}
 }
 
@@ -115,8 +165,13 @@ func (h *Handler) HandleMessage(ctx context.Context, msg *bot.C2CMessage) {
 		return
 	}
 
-	// 5. 管理员指令路由
-	// 5.1 优先检测是否附带了文件附件 (例如直接向机器人发送包含 Cookie 的 .txt/.json 文件)
+	// 5. 优先检测当前用户是否存在进行中的手机验证码登录会话
+	if h.processPhoneSessionInput(ctx, senderOpenID, msgID, content) {
+		return
+	}
+
+	// 6. 管理员指令路由
+	// 6.1 优先检测是否附带了文件附件 (例如直接向机器人发送包含 Cookie 的 .txt/.json 文件)
 	if len(msg.Attachments) > 0 {
 		h.handleAttachment(ctx, senderOpenID, msgID, msg.Attachments)
 		return
@@ -130,11 +185,23 @@ func (h *Handler) HandleMessage(ctx context.Context, msg *bot.C2CMessage) {
 	case lower == "/status" || lower == "/info" || lower == "状态":
 		h.handleStatus(ctx, senderOpenID, msgID)
 
+	case strings.HasPrefix(lower, "/login phone") || strings.HasPrefix(lower, "/phone"):
+		h.handlePhoneLogin(ctx, senderOpenID, msgID, content)
+
+	case lower == "/cancel" || lower == "cancel" || lower == "取消":
+		h.handleCancelSession(ctx, senderOpenID, msgID)
+
 	case lower == "/login" || lower == "/qrcode" || lower == "扫码" || strings.HasPrefix(lower, "/login ") || strings.HasPrefix(lower, "/qrcode "):
 		h.handleQrcodeLogin(ctx, senderOpenID, msgID, content)
 
 	case lower == "/run" || strings.HasPrefix(lower, "/run ") || lower == "运行" || lower == "打卡":
 		h.handleRunTask(ctx, senderOpenID, msgID, content)
+
+	case strings.HasPrefix(lower, "/exec") || strings.HasPrefix(lower, "/cmd"):
+		h.handleExecCommand(ctx, senderOpenID, msgID, content)
+
+	case lower == "/log" || strings.HasPrefix(lower, "/log "):
+		h.handleLogCommand(ctx, senderOpenID, msgID, content)
 
 	case strings.HasPrefix(lower, "/cookie") || isCookieString(content):
 		h.handleCookieUpdate(ctx, senderOpenID, msgID, content)
@@ -149,16 +216,20 @@ func (h *Handler) handleHelp(ctx context.Context, openID, msgID string) {
 	menu := `📖【NCMM QQ 机器人功能菜单】
 ------------------------
 🔑 账号登录与 Cookie 更新：
+• /phone <手机号>    ：手机验证码登录（支持多轮交互，安全便捷）
+• /phone <手机号> main：登录并保存/覆盖为主账号（支持指定 fan1.json 等）
 • /login 或 /qrcode  ：获取网易云登录授权链接（手机点击一键授权最便捷）
-• 发送文件（强烈推荐）：直接发送包含 Cookie 的【.txt/.json】文件，秒级解析并绑定
+• 发送文件          ：直接发送包含 Cookie 的【.txt/.json】文件，秒级解析并绑定
 • 发送文本          ：/cookie MUSIC_U=xxxxxx 或完整 Cookie
 • 指定小号更新      ：/cookie <账号别名> MUSIC_U=xxxxxx
 
 ⚡ 控制与查询：
-• /status ：查看各账号状态与配置文件
-• /run    ：立即触发日常打卡任务
-• /myid   ：查看我的 OpenID 标识
-• /help   ：查看本帮助菜单
+• /exec <命令> [参数]：手动执行任意 ncmm 命令（如 /exec musician-sign）
+• /log [行数]       ：查看正在运行或最近一次命令的执行日志（默认10行）
+• /run             ：立即触发日常打卡任务
+• /status          ：查看各账号状态与配置文件
+• /myid            ：查看我的 OpenID 标识
+• /help            ：查看本帮助菜单
 
 🌐 管理面板：访问本插件 Web 页面在线维护配置。`
 	h.replyText(ctx, openID, menu, msgID)
@@ -224,6 +295,76 @@ func (h *Handler) handleStatus(ctx context.Context, openID, msgID string) {
 }
 
 func (h *Handler) handleRunTask(ctx context.Context, openID, msgID, content string) {
+	args := []string{"task"}
+	parts := strings.Fields(content)
+	if len(parts) > 1 {
+		args = append(args, parts[1:]...)
+	}
+	h.executeCommandAsync(ctx, openID, msgID, args)
+}
+
+func (h *Handler) handleExecCommand(ctx context.Context, openID, msgID, content string) {
+	var cmdStr string
+	lower := strings.ToLower(content)
+	if strings.HasPrefix(lower, "/exec") {
+		cmdStr = strings.TrimSpace(content[5:])
+	} else if strings.HasPrefix(lower, "/cmd") {
+		cmdStr = strings.TrimSpace(content[4:])
+	} else {
+		cmdStr = strings.TrimSpace(content)
+	}
+
+	if cmdStr == "" {
+		usage := "💡 /exec 指令用法说明：\n" +
+			"------------------------\n" +
+			"• 格式: /exec <子命令> [参数...]\n" +
+			"• 示例: /exec musician-sign （签到网易云音乐人）\n" +
+			"• 示例: /exec fans （执行乐迷团日常）\n" +
+			"• 示例: /exec yunbei （执行云贝任务）\n" +
+			"• 示例: /exec vip （执行黑胶VIP任务）\n" +
+			"• 示例: /exec playids -f fan1.json （刷歌试听）\n" +
+			"• 示例: /exec notify test （测试通知推送）\n\n" +
+			"可随时发送 /log 查看执行日志与进度。"
+		h.replyText(ctx, openID, usage, msgID)
+		return
+	}
+
+	args, err := splitCommandArgs(cmdStr)
+	if err != nil {
+		h.replyText(ctx, openID, "❌ 命令解析失败: "+err.Error(), msgID)
+		return
+	}
+	if len(args) == 0 {
+		h.replyText(ctx, openID, "⚠️ 请输入要执行的子命令，例如: /exec musician-sign", msgID)
+		return
+	}
+
+	// 安全与常驻命令拦截
+	sub := strings.ToLower(args[0])
+	if sub == "web" || sub == "daemon" {
+		h.replyText(ctx, openID, fmt.Sprintf("⚠️ 无法在 QQ 聊天中运行常驻服务指令: ncmm %s", sub), msgID)
+		return
+	}
+
+	// 拦截未带参数的交互式 login phone，引导使用专属的 /phone
+	if sub == "login" && len(args) > 1 && strings.ToLower(args[1]) == "phone" {
+		hasCaptchaOrSend := false
+		for _, a := range args[2:] {
+			if a == "--send-only" || strings.HasPrefix(a, "--captcha") {
+				hasCaptchaOrSend = true
+				break
+			}
+		}
+		if !hasCaptchaOrSend {
+			h.replyText(ctx, openID, "💡 手机验证码登录请直接发送 /phone 指令（支持 QQ 私聊多轮交互输入验证码）。", msgID)
+			return
+		}
+	}
+
+	h.executeCommandAsync(ctx, openID, msgID, args)
+}
+
+func (h *Handler) executeCommandAsync(ctx context.Context, openID, msgID string, args []string) {
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
@@ -231,13 +372,27 @@ func (h *Handler) handleRunTask(ctx context.Context, openID, msgID, content stri
 		return
 	}
 
-	args := []string{"task"}
-	parts := strings.Fields(content)
-	if len(parts) > 1 {
-		args = append(args, parts[1:]...)
+	h.execMu.Lock()
+	if h.activeExec != nil && h.activeExec.IsRunning {
+		runningCmd := h.activeExec.Command
+		elapsed := time.Since(h.activeExec.StartTime).Round(time.Second)
+		h.execMu.Unlock()
+		h.replyText(ctx, openID, fmt.Sprintf("⚠️ 当前已有命令正在后台执行中:\n> %s (已运行 %v)\n\n可发送 /log 查看当前执行进度，请等待完成后再发起新命令。", runningCmd, elapsed), msgID)
+		return
 	}
 
-	h.replyText(ctx, openID, fmt.Sprintf("🚀 开始执行命令: ncmm %s\n任务已在后台启动，请稍候...", strings.Join(args, " ")), msgID)
+	cmdDisplay := "ncmm " + strings.Join(args, " ")
+	record := &ExecRecord{
+		Command:   cmdDisplay,
+		Args:      args,
+		StartTime: time.Now(),
+		IsRunning: true,
+		buf:       &safeBuffer{},
+	}
+	h.activeExec = record
+	h.execMu.Unlock()
+
+	h.replyText(ctx, openID, fmt.Sprintf("🚀 正在后台执行: %s\n任务已在后台运行中，可随时发送 /log 查看执行日志。", cmdDisplay), msgID)
 
 	go func() {
 		cmdCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -245,25 +400,80 @@ func (h *Handler) handleRunTask(ctx context.Context, openID, msgID, content stri
 
 		cmd := exec.CommandContext(cmdCtx, ncmmExe, args...)
 		cmd.Dir = cfg.NCMMHome
-
-		var outBuf, errBuf bytes.Buffer
-		cmd.Stdout = &outBuf
-		cmd.Stderr = &errBuf
+		cmd.Stdout = record.buf
+		cmd.Stderr = record.buf
 
 		err := cmd.Run()
-		outStr := strings.TrimSpace(outBuf.String())
-		if len(outStr) > 400 {
-			outStr = outStr[:400] + "\n...(日志过长已截断)"
-		}
 
-		if err != nil {
-			msg := fmt.Sprintf("❌ 任务执行完成但有报错:\n%v\n\n日志摘要:\n%s", err, outStr)
-			h.replyText(context.Background(), openID, msg, "")
-		} else {
-			msg := fmt.Sprintf("✅ 任务执行成功完成！\n\n日志摘要:\n%s", outStr)
-			h.replyText(context.Background(), openID, msg, "")
+		h.execMu.Lock()
+		record.IsRunning = false
+		record.EndTime = time.Now()
+		record.Duration = record.EndTime.Sub(record.StartTime)
+		record.Output = record.buf.String()
+		record.Err = err
+		if cmd.ProcessState != nil {
+			record.ExitCode = cmd.ProcessState.ExitCode()
+		} else if err != nil {
+			record.ExitCode = 1
 		}
+		h.lastExec = record
+		h.activeExec = nil
+		h.execMu.Unlock()
 	}()
+}
+
+func (h *Handler) handleLogCommand(ctx context.Context, openID, msgID, content string) {
+	lineCount := 10 // 默认打印 10 行 (符合用户偏好)
+	parts := strings.Fields(content)
+	if len(parts) > 1 {
+		if n, err := strconv.Atoi(parts[1]); err == nil && n > 0 {
+			if n > 80 {
+				lineCount = 80
+			} else {
+				lineCount = n
+			}
+		}
+	}
+
+	h.execMu.Lock()
+	active := h.activeExec
+	last := h.lastExec
+	h.execMu.Unlock()
+
+	if active != nil && active.IsRunning {
+		rawOutput := active.buf.String()
+		clean := stripAnsi(rawOutput)
+		lastLines := getLastLines(clean, lineCount)
+		if strings.TrimSpace(lastLines) == "" {
+			lastLines = "(任务刚启动，暂未产生日志)"
+		}
+		elapsed := time.Since(active.StartTime).Round(time.Second)
+		resp := fmt.Sprintf("⏳ 任务正在运行中 (已耗时 %v):\n%s\n\n--- 最新输出 (末尾 %d 行) ---\n%s",
+			elapsed, active.Command, lineCount, lastLines)
+		h.replyText(ctx, openID, resp, msgID)
+		return
+	}
+
+	if last != nil {
+		rawOutput := last.Output
+		clean := stripAnsi(rawOutput)
+		lastLines := getLastLines(clean, lineCount)
+		if strings.TrimSpace(lastLines) == "" {
+			lastLines = "(无输出日志)"
+		}
+		statusDesc := "✅ 成功"
+		if last.Err != nil || last.ExitCode != 0 {
+			statusDesc = fmt.Sprintf("❌ 失败 (code: %d)", last.ExitCode)
+		}
+		dur := last.Duration.Round(100 * time.Millisecond)
+		endStr := last.EndTime.Format("15:04:05")
+		resp := fmt.Sprintf("📄 最近执行记录: %s\n状态: %s (耗时: %v, 完成于 %s)\n\n--- 日志内容 (末尾 %d 行) ---\n%s",
+			last.Command, statusDesc, dur, endStr, lineCount, lastLines)
+		h.replyText(ctx, openID, resp, msgID)
+		return
+	}
+
+	h.replyText(ctx, openID, "ℹ️ 暂无最近执行记录。可通过 /exec 或 /run 运行任务后再发送 /log 查看。", msgID)
 }
 
 type LoginJSONResult struct {
@@ -392,24 +602,8 @@ func (h *Handler) processCookieString(ctx context.Context, openID, msgID, alias,
 		return
 	}
 
-	var res LoginJSONResult
-	// 找到 JSON 行 (兼容带 NCMM_LOGIN_RESULT 前缀输出)
-	lines := strings.Split(probeOut.String(), "\n")
-	foundJSON := false
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		line = strings.TrimPrefix(line, "NCMM_LOGIN_RESULT")
-		line = strings.TrimSpace(line)
-		if idx := strings.Index(line, "{"); idx >= 0 && strings.HasSuffix(line, "}") {
-			jsonStr := line[idx:]
-			if json.Unmarshal([]byte(jsonStr), &res) == nil && res.UID > 0 {
-				foundJSON = true
-				break
-			}
-		}
-	}
-
-	if !foundJSON || res.UID == 0 {
+	res, ok := parseLoginResult(probeOut.String())
+	if !ok || res.UID == 0 {
 		h.replyText(ctx, openID, "❌ 登录成功但无法解析账号信息: \n"+probeOut.String(), msgID)
 		return
 	}
@@ -686,4 +880,446 @@ func CleanExpiredTempDirs(tmpBase string, maxAge time.Duration) {
 			_ = os.RemoveAll(filepath.Join(tmpBase, entry.Name()))
 		}
 	}
+}
+
+func (h *Handler) handlePhoneLogin(ctx context.Context, openID, msgID, content string) {
+	cfg := h.cfgGetter.Get()
+	ncmmExe := cfg.NCMMExe
+	if ncmmExe == "" {
+		h.replyText(ctx, openID, "❌ 未配置 ncmm 可执行文件，无法发起手机登录", msgID)
+		return
+	}
+
+	phone, ctcode, target, err := parsePhoneArgs(content)
+	if err != nil {
+		h.replyText(ctx, openID, "💡 手机登录用法：\n/phone <手机号> [main/文件名] [--ctcode 区号]\n\n示例:\n• /phone 13800138000\n• /phone 13800138000 main\n• /phone 13800138000 fan1.json\n• /phone +85298765432", msgID)
+		return
+	}
+
+	h.replyText(ctx, openID, fmt.Sprintf("📲 正在向 +%d %s 请求发送短信验证码，请稍候...", ctcode, maskPhone(phone)), msgID)
+
+	cmdCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, ncmmExe, "login", "phone", phone, "--countrycode", strconv.FormatInt(ctcode, 10), "--send-only")
+	cmd.Dir = cfg.NCMMHome
+
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	if err := cmd.Run(); err != nil {
+		errInfo := errBuf.String()
+		if errInfo == "" {
+			errInfo = outBuf.String()
+		}
+		h.replyText(ctx, openID, fmt.Sprintf("❌ 发送短信验证码失败: %v\n%s", err, strings.TrimSpace(errInfo)), msgID)
+		return
+	}
+
+	session := &PhoneLoginSession{
+		OpenID:      openID,
+		Cellphone:   phone,
+		CountryCode: ctcode,
+		Target:      target,
+		Step:        0,
+		CreatedAt:   time.Now(),
+		ExpiresAt:   time.Now().Add(5 * time.Minute),
+	}
+	h.phoneMu.Lock()
+	h.phoneSessions[openID] = session
+	h.phoneMu.Unlock()
+
+	targetDesc := ""
+	if target != "" {
+		targetDesc = fmt.Sprintf("\n(登录成功后将绑定至: %s)", target)
+	}
+
+	reply := fmt.Sprintf("📲 短信验证码已成功发送至 +%d %s！%s\n\n请直接回复收到的 4~6 位数字验证码（如直接发送 123456 或 /code 123456）。\n⏰ 验证码 5 分钟内有效，回复 /cancel 可随时取消。",
+		ctcode, maskPhone(phone), targetDesc)
+	h.replyText(ctx, openID, reply, msgID)
+}
+
+func (h *Handler) processPhoneSessionInput(ctx context.Context, openID, msgID, content string) bool {
+	h.phoneMu.Lock()
+	session, ok := h.phoneSessions[openID]
+	if !ok {
+		h.phoneMu.Unlock()
+		return false
+	}
+	if time.Now().After(session.ExpiresAt) {
+		delete(h.phoneSessions, openID)
+		h.phoneMu.Unlock()
+		h.replyText(ctx, openID, "⏰ 手机验证码登录会话已超时失效，请重新发送 /phone 发起登录。", msgID)
+		return false
+	}
+	h.phoneMu.Unlock()
+
+	trimmed := strings.TrimSpace(content)
+	lower := strings.ToLower(trimmed)
+
+	if lower == "/cancel" || lower == "cancel" || lower == "取消" {
+		h.phoneMu.Lock()
+		delete(h.phoneSessions, openID)
+		h.phoneMu.Unlock()
+		h.replyText(ctx, openID, "🛑 已取消本次手机验证码登录。", msgID)
+		return true
+	}
+
+	// 若用户输入以斜杠开头且不是 /code 或 /name，检查是否是取消并切换其他指令
+	if strings.HasPrefix(lower, "/") && !strings.HasPrefix(lower, "/code") && !strings.HasPrefix(lower, "/name") {
+		if strings.HasPrefix(lower, "/phone") || strings.HasPrefix(lower, "/login") {
+			h.phoneMu.Lock()
+			delete(h.phoneSessions, openID)
+			h.phoneMu.Unlock()
+			return false
+		}
+		return false
+	}
+
+	if session.Step == 0 {
+		captcha := trimmed
+		if strings.HasPrefix(lower, "/code ") {
+			captcha = strings.TrimSpace(trimmed[6:])
+		} else if strings.HasPrefix(lower, "code ") {
+			captcha = strings.TrimSpace(trimmed[5:])
+		}
+		if len(captcha) < 4 || len(captcha) > 8 {
+			return false
+		}
+		h.handlePhoneVerifyCaptcha(ctx, openID, msgID, session, captcha)
+		return true
+	} else if session.Step == 1 {
+		nickname := trimmed
+		if strings.HasPrefix(lower, "/name ") {
+			nickname = strings.TrimSpace(trimmed[6:])
+		} else if strings.HasPrefix(lower, "name ") {
+			nickname = strings.TrimSpace(trimmed[5:])
+		}
+		if nickname == "" {
+			h.replyText(ctx, openID, "⚠️ 昵称不能为空，请回复希望设置的新账号昵称（或回复 /cancel 取消）。", msgID)
+			return true
+		}
+		h.handlePhoneSubmitNickname(ctx, openID, msgID, session, nickname)
+		return true
+	}
+
+	return false
+}
+
+func (h *Handler) handlePhoneVerifyCaptcha(ctx context.Context, openID, msgID string, session *PhoneLoginSession, captcha string) {
+	cfg := h.cfgGetter.Get()
+	ncmmExe := cfg.NCMMExe
+
+	h.replyText(ctx, openID, "⏳ 正在校验验证码并登录网易云音乐，请稍候...", msgID)
+
+	args := []string{
+		"login", "phone", session.Cellphone,
+		"--countrycode", strconv.FormatInt(session.CountryCode, 10),
+		"--captcha", captcha,
+		"--json-result",
+	}
+
+	if session.Target != "" {
+		if strings.EqualFold(session.Target, "main") || session.Target == "主" || session.Target == "主账号" {
+			args = append(args, "--main")
+		} else {
+			targetFile := session.Target
+			if !strings.HasSuffix(strings.ToLower(targetFile), ".json") {
+				targetFile += ".json"
+			}
+			args = append(args, "-o", targetFile)
+		}
+	}
+
+	cmdCtx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, ncmmExe, args...)
+	cmd.Dir = cfg.NCMMHome
+
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	outStr := outBuf.String()
+	errStr := errBuf.String()
+	combinedOut := outStr + "\n" + errStr
+
+	// 检查是否二次放号/新号注册 (code: 8860)
+	if strings.Contains(combinedOut, "8860") || strings.Contains(combinedOut, "二次放号") {
+		session.Step = 1
+		session.Captcha = captcha
+		session.ExpiresAt = time.Now().Add(5 * time.Minute)
+		h.replyText(ctx, openID, "⚠️ 检测到该号码为未注册新号或二次放号，请直接回复希望设置的新账号昵称（如直接发送 听歌达人 或 /name 听歌达人）。", msgID)
+		return
+	}
+
+	h.phoneMu.Lock()
+	delete(h.phoneSessions, openID)
+	h.phoneMu.Unlock()
+
+	if err != nil {
+		h.replyText(ctx, openID, fmt.Sprintf("❌ 登录失败: %v\n%s", err, cleanOutput(errStr, outStr)), msgID)
+		return
+	}
+
+	res, ok := parseLoginResult(outStr)
+	if !ok || res.UID == 0 {
+		h.replyText(ctx, openID, "🎉 登录命令已执行完成:\n"+cleanOutput(outStr, errStr), msgID)
+		return
+	}
+
+	accType := "【辅助账号】"
+	if res.Main {
+		accType = "【主账号】"
+	}
+
+	reply := fmt.Sprintf("🎉 手机验证码登录成功！\n------------------------\n身份类型: %s\n用户昵称: %s\n用户 UID: %d\n落盘位置: %s",
+		accType, res.Nickname, res.UID, res.AccountPath)
+	h.replyText(ctx, openID, reply, msgID)
+}
+
+func (h *Handler) handlePhoneSubmitNickname(ctx context.Context, openID, msgID string, session *PhoneLoginSession, nickname string) {
+	cfg := h.cfgGetter.Get()
+	ncmmExe := cfg.NCMMExe
+
+	h.replyText(ctx, openID, fmt.Sprintf("⏳ 正在为手机号注册新账号 (昵称: %s)，请稍候...", nickname), msgID)
+
+	args := []string{
+		"login", "phone", session.Cellphone,
+		"--countrycode", strconv.FormatInt(session.CountryCode, 10),
+		"--captcha", session.Captcha,
+		"--nickname", nickname,
+		"--json-result",
+	}
+
+	if session.Target != "" {
+		if strings.EqualFold(session.Target, "main") || session.Target == "主" || session.Target == "主账号" {
+			args = append(args, "--main")
+		} else {
+			targetFile := session.Target
+			if !strings.HasSuffix(strings.ToLower(targetFile), ".json") {
+				targetFile += ".json"
+			}
+			args = append(args, "-o", targetFile)
+		}
+	}
+
+	cmdCtx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, ncmmExe, args...)
+	cmd.Dir = cfg.NCMMHome
+
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	outStr := outBuf.String()
+	errStr := errBuf.String()
+
+	h.phoneMu.Lock()
+	delete(h.phoneSessions, openID)
+	h.phoneMu.Unlock()
+
+	if err != nil {
+		h.replyText(ctx, openID, fmt.Sprintf("❌ 注册新账号失败: %v\n%s", err, cleanOutput(errStr, outStr)), msgID)
+		return
+	}
+
+	res, ok := parseLoginResult(outStr)
+	if !ok || res.UID == 0 {
+		h.replyText(ctx, openID, "🎉 注册命令已完成:\n"+cleanOutput(outStr, errStr), msgID)
+		return
+	}
+
+	accType := "【辅助账号】"
+	if res.Main {
+		accType = "【主账号】"
+	}
+
+	reply := fmt.Sprintf("🎉 手机新账号注册并登录成功！\n------------------------\n身份类型: %s\n用户昵称: %s\n用户 UID: %d\n落盘位置: %s",
+		accType, res.Nickname, res.UID, res.AccountPath)
+	h.replyText(ctx, openID, reply, msgID)
+}
+
+func (h *Handler) handleCancelSession(ctx context.Context, openID, msgID string) {
+	h.phoneMu.Lock()
+	_, exists := h.phoneSessions[openID]
+	if exists {
+		delete(h.phoneSessions, openID)
+		h.phoneMu.Unlock()
+		h.replyText(ctx, openID, "🛑 已取消正在进行中的手机验证码登录会话。", msgID)
+		return
+	}
+	h.phoneMu.Unlock()
+	h.replyText(ctx, openID, "ℹ️ 当前没有进行中的会话。", msgID)
+}
+
+func parsePhoneArgs(content string) (phone string, ctcode int64, target string, err error) {
+	ctcode = 86
+	content = strings.TrimSpace(content)
+	var rest string
+	lower := strings.ToLower(content)
+	if strings.HasPrefix(lower, "/login phone") {
+		rest = strings.TrimSpace(content[len("/login phone"):])
+	} else if strings.HasPrefix(lower, "/phone") {
+		rest = strings.TrimSpace(content[len("/phone"):])
+	} else {
+		rest = content
+	}
+
+	parts := strings.Fields(rest)
+	if len(parts) == 0 {
+		return "", 0, "", fmt.Errorf("请输入手机号码，例如: /phone 13800138000")
+	}
+
+	rawPhone := parts[0]
+	if strings.HasPrefix(rawPhone, "+") {
+		trimmed := strings.TrimPrefix(rawPhone, "+")
+		if strings.HasPrefix(trimmed, "86") && len(trimmed) > 8 {
+			ctcode = 86
+			phone = trimmed[2:]
+		} else if strings.HasPrefix(trimmed, "852") && len(trimmed) > 6 {
+			ctcode = 852
+			phone = trimmed[3:]
+		} else if strings.HasPrefix(trimmed, "886") && len(trimmed) > 6 {
+			ctcode = 886
+			phone = trimmed[3:]
+		} else if strings.HasPrefix(trimmed, "1") && len(trimmed) > 7 {
+			ctcode = 1
+			phone = trimmed[1:]
+		} else {
+			phone = trimmed
+		}
+	} else {
+		phone = rawPhone
+	}
+
+	phone = strings.ReplaceAll(phone, "-", "")
+	phone = strings.ReplaceAll(phone, " ", "")
+
+	for i := 1; i < len(parts); i++ {
+		arg := parts[i]
+		if arg == "--ctcode" || arg == "--countrycode" || arg == "-c" {
+			if i+1 < len(parts) {
+				cc, e := strconv.ParseInt(parts[i+1], 10, 64)
+				if e == nil && cc > 0 {
+					ctcode = cc
+				}
+				i++
+			}
+		} else if strings.EqualFold(arg, "main") || arg == "主" || arg == "主账号" {
+			target = "main"
+		} else if strings.HasSuffix(strings.ToLower(arg), ".json") {
+			target = arg
+		} else if cc, e := strconv.ParseInt(arg, 10, 64); e == nil && len(arg) <= 4 {
+			ctcode = cc
+		} else {
+			target = arg
+		}
+	}
+
+	if len(phone) < 5 {
+		return "", 0, "", fmt.Errorf("手机号码格式不正确: %s", phone)
+	}
+
+	return phone, ctcode, target, nil
+}
+
+func maskPhone(phone string) string {
+	if len(phone) >= 7 {
+		return phone[:3] + "****" + phone[len(phone)-4:]
+	}
+	return phone
+}
+
+func splitCommandArgs(s string) ([]string, error) {
+	var args []string
+	var current strings.Builder
+	inDoubleQuotes := false
+	inSingleQuotes := false
+	escaped := false
+
+	for _, r := range s {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == '"' && !inSingleQuotes {
+			inDoubleQuotes = !inDoubleQuotes
+			continue
+		}
+		if r == '\'' && !inDoubleQuotes {
+			inSingleQuotes = !inSingleQuotes
+			continue
+		}
+		if (r == ' ' || r == '\t') && !inDoubleQuotes && !inSingleQuotes {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+			continue
+		}
+		current.WriteRune(r)
+	}
+	if inDoubleQuotes || inSingleQuotes {
+		return nil, fmt.Errorf("命令行引号未闭合")
+	}
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	return args, nil
+}
+
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+func stripAnsi(str string) string {
+	return ansiRegex.ReplaceAllString(str, "")
+}
+
+func getLastLines(str string, n int) string {
+	str = strings.ReplaceAll(str, "\r\n", "\n")
+	lines := strings.Split(strings.TrimRight(str, "\n"), "\n")
+	if len(lines) <= n {
+		return strings.Join(lines, "\n")
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+func parseLoginResult(out string) (LoginJSONResult, bool) {
+	var res LoginJSONResult
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "NCMM_LOGIN_RESULT")
+		line = strings.TrimSpace(line)
+		if idx := strings.Index(line, "{"); idx >= 0 && strings.HasSuffix(line, "}") {
+			jsonStr := line[idx:]
+			if json.Unmarshal([]byte(jsonStr), &res) == nil && res.UID > 0 {
+				return res, true
+			}
+		}
+	}
+	return res, false
+}
+
+func cleanOutput(primary, fallback string) string {
+	s := strings.TrimSpace(primary)
+	if s == "" {
+		s = strings.TrimSpace(fallback)
+	}
+	s = stripAnsi(s)
+	if len(s) > 500 {
+		s = s[:500] + "\n...(输出过长已截断)"
+	}
+	return s
 }
