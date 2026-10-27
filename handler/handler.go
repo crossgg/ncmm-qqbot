@@ -364,11 +364,13 @@ func (h *Handler) handleExecCommand(ctx context.Context, openID, msgID, content 
 	h.executeCommandAsync(ctx, openID, msgID, args)
 }
 
+const errNoNcmmExe = "❌ 未检测到 ncmm 可执行程序：\n• 请在 WebUI 插件面板或配置文件中填写 ncmm_exe 绝对路径（如 D:\\ncmm\\ncmm.exe 或 /usr/local/bin/ncmm）；\n• 或确保将 ncmm 加入系统 PATH 环境变量后重启服务。"
+
 func (h *Handler) executeCommandAsync(ctx context.Context, openID, msgID string, args []string) {
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
-		h.replyText(ctx, openID, "❌ 未找到 ncmm 可执行文件路径，请在 Web 面板中配置 ncmm_exe", msgID)
+		h.replyText(ctx, openID, errNoNcmmExe, msgID)
 		return
 	}
 
@@ -575,7 +577,7 @@ func (h *Handler) processCookieString(ctx context.Context, openID, msgID, alias,
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
-		h.replyText(ctx, openID, "❌ 未配置 ncmm 可执行文件，无法更新 Cookie", msgID)
+		h.replyText(ctx, openID, errNoNcmmExe, msgID)
 		return
 	}
 
@@ -741,7 +743,7 @@ func (h *Handler) handleQrcodeLogin(ctx context.Context, openID, msgID, content 
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
-		h.replyText(ctx, openID, "❌ 未配置 ncmm 可执行文件，无法发起扫码登录", msgID)
+		h.replyText(ctx, openID, errNoNcmmExe, msgID)
 		return
 	}
 
@@ -886,7 +888,7 @@ func (h *Handler) handlePhoneLogin(ctx context.Context, openID, msgID, content s
 	cfg := h.cfgGetter.Get()
 	ncmmExe := cfg.NCMMExe
 	if ncmmExe == "" {
-		h.replyText(ctx, openID, "❌ 未配置 ncmm 可执行文件，无法发起手机登录", msgID)
+		h.replyText(ctx, openID, errNoNcmmExe, msgID)
 		return
 	}
 

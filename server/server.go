@@ -558,6 +558,12 @@ const htmlTemplate = `<!DOCTYPE html>
             <div class="help-text">程序会自动识别，一般无需手动修改。</div>
           </div>
 
+          <div class="form-group">
+            <label>NCMM 可执行程序路径 (NCMM_EXE)</label>
+            <input type="text" id="ncmm_exe" placeholder="自动探测（如 /usr/local/bin/ncmm 或 D:\ncmm\ncmm.exe）">
+            <div class="help-text">执行扫码登录与打卡任务时调用的宿主二进制，留空将自动多级探测。</div>
+          </div>
+
           <div class="btn-group">
             <button type="submit" class="btn-primary">💾 保存配置并应用</button>
             <button type="button" class="btn-secondary" id="btnTestToken">⚡ 测试凭证连接</button>
@@ -620,6 +626,7 @@ webhook:
           document.getElementById('port').value = data.config.port || 5606;
           document.getElementById('host').value = data.config.host || '0.0.0.0';
           document.getElementById('ncmm_home').value = data.config.ncmm_home || '';
+          document.getElementById('ncmm_exe').value = data.config.ncmm_exe || '';
           updateWebhookPreview();
         }
 
@@ -671,6 +678,7 @@ webhook:
         port: parseInt(document.getElementById('port').value) || 5606,
         host: document.getElementById('host').value.trim() || '0.0.0.0',
         ncmm_home: document.getElementById('ncmm_home').value.trim(),
+        ncmm_exe: document.getElementById('ncmm_exe').value.trim(),
       };
 
       try {

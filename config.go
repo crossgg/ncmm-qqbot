@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -87,7 +88,7 @@ func (cm *ConfigManager) Load() (*Config, error) {
 	if cfg.Host == "" {
 		cfg.Host = "127.0.0.1"
 	}
-	if cfg.NCMMHome == "" || cfg.NCMMExe == "" {
+	if cfg.NCMMHome == "" || cfg.NCMMExe == "" || !fileExists(cfg.NCMMExe) {
 		detectHostEnv(cfg)
 	}
 
@@ -99,6 +100,9 @@ func (cm *ConfigManager) Load() (*Config, error) {
 func (cm *ConfigManager) Save(newCfg *Config) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	if newCfg.NCMMHome == "" || newCfg.NCMMExe == "" || !fileExists(newCfg.NCMMExe) {
+		detectHostEnv(newCfg)
+	}
 	if err := cm.saveLocked(newCfg); err != nil {
 		return err
 	}
@@ -135,23 +139,22 @@ func (cm *ConfigManager) saveLocked(newCfg *Config) error {
 	return nil
 }
 
-// detectHostEnv 尝试自动探测 ncmm 主目录与可执行文件
+// detectHostEnv 尝试多级自动探测 ncmm 主目录与可执行文件
 func detectHostEnv(cfg *Config) {
+	// --- A. 探测 NCMM_HOME (数据/配置主目录) ---
 	// 1. 优先读取环境变量
-	if envHome := os.Getenv("NCMM_HOME"); envHome != "" && cfg.NCMMHome == "" {
+	if envHome := os.Getenv("NCMM_HOME"); envHome != "" && (cfg.NCMMHome == "" || !isNCMMDir(cfg.NCMMHome)) {
 		cfg.NCMMHome = filepath.Clean(envHome)
 	}
 
 	// 2. 向上逐级探测（插件位于 plugins/ncmm-qqbot 下）
-	if cfg.NCMMHome == "" {
+	if cfg.NCMMHome == "" || !isNCMMDir(cfg.NCMMHome) {
 		if exe, err := os.Executable(); err == nil {
 			curDir := filepath.Dir(exe)
-			// 如果在 plugins/ncmm-qqbot 目录下，祖父目录即为主目录
 			candidate := filepath.Clean(filepath.Join(curDir, "..", ".."))
 			if isNCMMDir(candidate) {
 				cfg.NCMMHome = candidate
 			} else {
-				// 尝试父级
 				candidate = filepath.Clean(filepath.Join(curDir, ".."))
 				if isNCMMDir(candidate) {
 					cfg.NCMMHome = candidate
@@ -161,7 +164,7 @@ func detectHostEnv(cfg *Config) {
 	}
 
 	// 3. 兜底为工作目录上一级
-	if cfg.NCMMHome == "" {
+	if cfg.NCMMHome == "" || !isNCMMDir(cfg.NCMMHome) {
 		if wd, err := os.Getwd(); err == nil {
 			candidate := filepath.Clean(filepath.Join(wd, "..", ".."))
 			if isNCMMDir(candidate) {
@@ -170,20 +173,81 @@ func detectHostEnv(cfg *Config) {
 				candidate = filepath.Clean(filepath.Join(wd, ".."))
 				if isNCMMDir(candidate) {
 					cfg.NCMMHome = candidate
+				} else if isNCMMDir(wd) {
+					cfg.NCMMHome = wd
 				}
 			}
 		}
 	}
 
-	// 探测 ncmm.exe
-	if cfg.NCMMExe == "" && cfg.NCMMHome != "" {
-		exeName := "ncmm"
-		if isWindows() {
-			exeName = "ncmm.exe"
+	// --- B. 探测 ncmm / ncmm.exe 可执行文件 ---
+	if cfg.NCMMExe != "" && fileExists(cfg.NCMMExe) {
+		return
+	}
+
+	exeName := "ncmm"
+	if isWindows() {
+		exeName = "ncmm.exe"
+	}
+
+	// 1. 优先读取宿主注入的环境变量 NCMM_EXE
+	if envExe := os.Getenv("NCMM_EXE"); envExe != "" && fileExists(envExe) {
+		cfg.NCMMExe = filepath.Clean(envExe)
+		log.Printf("[QQBot-Config] 通过 NCMM_EXE 环境变量检测到宿主程序: %s", cfg.NCMMExe)
+		return
+	}
+
+	// 2. 探测系统环境变量 PATH (exec.LookPath)
+	if lp, err := exec.LookPath(exeName); err == nil && lp != "" {
+		if absLp, err := filepath.Abs(lp); err == nil && fileExists(absLp) {
+			cfg.NCMMExe = absLp
+			log.Printf("[QQBot-Config] 通过系统 PATH 检测到宿主程序: %s", cfg.NCMMExe)
+			return
 		}
-		candidate := filepath.Join(cfg.NCMMHome, exeName)
+	}
+
+	// 3. 探测当前插件执行目录的上一级 / 上两级（针对 plugins/ncmm-qqbot 布局）
+	if exe, err := os.Executable(); err == nil {
+		curDir := filepath.Dir(exe)
+		candidates := []string{
+			filepath.Join(curDir, "..", "..", exeName),
+			filepath.Join(curDir, "..", exeName),
+			filepath.Join(curDir, exeName),
+		}
+		for _, c := range candidates {
+			cClean := filepath.Clean(c)
+			if fileExists(cClean) {
+				cfg.NCMMExe = cClean
+				log.Printf("[QQBot-Config] 通过插件目录父级检测到宿主程序: %s", cfg.NCMMExe)
+				return
+			}
+		}
+	}
+
+	// 4. 探测当前工作目录及其父级
+	if wd, err := os.Getwd(); err == nil {
+		candidates := []string{
+			filepath.Join(wd, exeName),
+			filepath.Join(wd, "..", "..", exeName),
+			filepath.Join(wd, "..", exeName),
+		}
+		for _, c := range candidates {
+			cClean := filepath.Clean(c)
+			if fileExists(cClean) {
+				cfg.NCMMExe = cClean
+				log.Printf("[QQBot-Config] 通过工作目录检测到宿主程序: %s", cfg.NCMMExe)
+				return
+			}
+		}
+	}
+
+	// 5. 探测 NCMM_HOME 目录下
+	if cfg.NCMMHome != "" {
+		candidate := filepath.Clean(filepath.Join(cfg.NCMMHome, exeName))
 		if fileExists(candidate) {
 			cfg.NCMMExe = candidate
+			log.Printf("[QQBot-Config] 在 NCMM_HOME 目录下检测到宿主程序: %s", cfg.NCMMExe)
+			return
 		}
 	}
 }
